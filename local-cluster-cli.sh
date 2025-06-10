@@ -395,7 +395,7 @@ show_cluster_info() {
 # Show help
 show_help() {
     cat << EOF
-Minikube Management CLI Tool
+Minikube Management CLI Tool for SoI Engineers
 
 USAGE:
     $0 [COMMAND] [OPTIONS]
