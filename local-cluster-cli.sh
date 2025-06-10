@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Minikube Management CLI Tool for SoI engineers
-# Usage: ./local-cluster.sh [COMMAND] [OPTIONS]
+# Minikube Management CLI Tool
+# Usage: ./minikube-manager.sh [COMMAND] [OPTIONS]
 
 set -e
 
@@ -13,7 +13,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Network configuration for corporate environments
-WGET_FLAGS="--no-check-certificate --timeout=30 --tries=3"
+CURL_FLAGS="-k --connect-timeout 30 --retry 3 --retry-delay 5"
 APT_FLAGS="-o Acquire::https::Verify-Peer=false -o Acquire::https::Verify-Host=false"
 MINIKUBE_MEMORY="4096"
 MINIKUBE_CPUS="2"
@@ -124,8 +124,8 @@ check_requirements() {
     # Check for required commands
     local missing_deps=()
     
-    if ! command_exists wget; then
-        missing_deps+=("wget")
+    if ! command_exists curl; then
+        missing_deps+=("curl")
     fi
     
     if [[ "$MINIKUBE_DRIVER" == "virtualbox" ]] && ! command_exists vboxmanage; then
@@ -138,8 +138,8 @@ check_requirements() {
         sudo apt-get $APT_FLAGS update
         for dep in "${missing_deps[@]}"; do
             case $dep in
-                wget)
-                    sudo apt-get $APT_FLAGS install -y wget
+                curl)
+                    sudo apt-get $APT_FLAGS install -y curl
                     ;;
                 virtualbox)
                     sudo apt-get $APT_FLAGS install -y virtualbox
@@ -196,10 +196,10 @@ install_minikube() {
     log_info "Downloading Minikube binary..."
     if [[ ! -w "$install_dir" ]]; then
         log_info "Installing to $install_dir requires sudo privileges"
-        sudo wget $WGET_FLAGS -O "$install_dir/minikube" "$minikube_url"
+        sudo curl $CURL_FLAGS -Lo "$install_dir/minikube" "$minikube_url"
         sudo chmod +x "$install_dir/minikube"
     else
-        wget $WGET_FLAGS -O "$install_dir/minikube" "$minikube_url"
+        curl $CURL_FLAGS -Lo "$install_dir/minikube" "$minikube_url"
         chmod +x "$install_dir/minikube"
     fi
     
@@ -231,7 +231,7 @@ install_kubectl() {
         local kubectl_version="$KUBECTL_VERSION"
     else
         log_info "Getting latest kubectl version..."
-        local kubectl_version=$(wget $WGET_FLAGS -qO- "$version_url")
+        local kubectl_version=$(curl $CURL_FLAGS -s "$version_url")
         if [[ -z "$kubectl_version" ]]; then
             log_warning "Could not fetch latest version, using fallback version"
             kubectl_version="v1.30.0"  # Fallback version
@@ -245,10 +245,10 @@ install_kubectl() {
     log_info "Downloading kubectl binary..."
     if [[ ! -w "$install_dir" ]]; then
         log_info "Installing to $install_dir requires sudo privileges"
-        sudo wget $WGET_FLAGS -O "$install_dir/kubectl" "$kubectl_url"
+        sudo curl $CURL_FLAGS -Lo "$install_dir/kubectl" "$kubectl_url"
         sudo chmod +x "$install_dir/kubectl"
     else
-        wget $WGET_FLAGS -O "$install_dir/kubectl" "$kubectl_url"
+        curl $CURL_FLAGS -Lo "$install_dir/kubectl" "$kubectl_url"
         chmod +x "$install_dir/kubectl"
     fi
     
@@ -389,7 +389,7 @@ show_cluster_info() {
 # Show help
 show_help() {
     cat << EOF
-Minikube Management CLI Tool for SoI engineers
+Minikube Management CLI Tool
 
 USAGE:
     $0 [COMMAND] [OPTIONS]
