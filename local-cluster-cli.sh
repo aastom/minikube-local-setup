@@ -96,7 +96,7 @@ install_docker() {
     # Add Docker's official GPG key
     log_info "Adding Docker GPG key..."
     sudo mkdir -p /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    curl -fsSL -k https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     
     # Set up the Docker repository
     log_info "Setting up Docker repository..."
@@ -211,10 +211,10 @@ install_minikube() {
     
     if [[ ! -w "$install_dir" ]]; then
         log_info "Installing to $install_dir requires sudo privileges"
-        sudo curl -Lo "$install_dir/minikube" "$minikube_url"
+        sudo curl -Lo -k "$install_dir/minikube" "$minikube_url"
         sudo chmod +x "$install_dir/minikube"
     else
-        curl -Lo "$install_dir/minikube" "$minikube_url"
+        curl -Lo -k "$install_dir/minikube" "$minikube_url"
         chmod +x "$install_dir/minikube"
     fi
     
@@ -245,7 +245,7 @@ install_kubectl() {
     if [[ -n "$KUBECTL_VERSION" ]]; then
         local kubectl_version="$KUBECTL_VERSION"
     else
-        local kubectl_version=$(curl -L -s "$version_url")
+        local kubectl_version=$(curl -L -s -k "$version_url")
     fi
     
     # Download and install kubectl
@@ -254,10 +254,10 @@ install_kubectl() {
     
     if [[ ! -w "$install_dir" ]]; then
         log_info "Installing to $install_dir requires sudo privileges"
-        sudo curl -Lo "$install_dir/kubectl" "$kubectl_url"
+        sudo curl -Lo -k "$install_dir/kubectl" "$kubectl_url"
         sudo chmod +x "$install_dir/kubectl"
     else
-        curl -Lo "$install_dir/kubectl" "$kubectl_url"
+        curl -Lo -k "$install_dir/kubectl" "$kubectl_url"
         chmod +x "$install_dir/kubectl"
     fi
     
