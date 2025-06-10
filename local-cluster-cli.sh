@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Minikube Management CLI Tool
-# Usage: ./minikube-manager.sh [COMMAND] [OPTIONS]
+# Enterprise Kubernetes Local Cluster Management Tool
+# Usage: ./local-cluster-cli.sh [COMMAND] [OPTIONS]
 
 set -e
 
@@ -12,30 +12,133 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Network configuration for corporate environments
-WGET_FLAGS="--no-check-certificate --timeout=30 --tries=3"
+# Enterprise environment configuration
+WGET_FLAGS="--no-check-certificate --timeout=60 --tries=5 --retry-connrefused"
+CURL_FLAGS="--insecure --connect-timeout 60 --retry 5 --retry-connrefused"
 APT_FLAGS="-o Acquire::https::Verify-Peer=false -o Acquire::https::Verify-Host=false"
+HTTP_PROXY_ENV=""
+HTTPS_PROXY_ENV=""
+NO_PROXY_ENV="localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local,.internal"
 MINIKUBE_MEMORY="4096"
 MINIKUBE_CPUS="2"
-MINIKUBE_DISK_SIZE="20g"
-KUBECTL_VERSION=""
-PROFILE_NAME="minikube"
+MINIKUBE_DISK_SIZE="40g"
+MINIKUBE_DRIVER="docker"
+KUBECTL_VERSION="v1.31.1"
+PROFILE_NAME="enterprise-k8s"
+REGISTRY_MIRRORS=""
+INSECURE_REGISTRIES="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+CONFIG_DIR="$HOME/.local-cluster-cli"
+LOG_FILE="$CONFIG_DIR/cluster.log"
 
-# Logging functions
+# Create config directory if it doesn't exist
+mkdir -p "$CONFIG_DIR"
+
+# Logging functions with timestamps
+log() {
+    local level=$1
+    local message=$2
+    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    echo -e "[$timestamp] $level $message" | tee -a "$LOG_FILE"
+}
+
 log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+    log "${BLUE}INFO${NC}" "$1"
 }
 
 log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+    log "${GREEN}SUCCESS${NC}" "$1"
 }
 
 log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
+    log "${YELLOW}WARNING${NC}" "$1"
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    log "${RED}ERROR${NC}" "$1"
+}
+
+# Load proxy settings from environment or config file
+load_proxy_settings() {
+    # Check for proxy settings in environment
+    if [[ -n "$http_proxy" || -n "$HTTP_PROXY" ]]; then
+        HTTP_PROXY_ENV="${http_proxy:-$HTTP_PROXY}"
+        log_info "Using HTTP proxy from environment: $HTTP_PROXY_ENV"
+    fi
+    
+    if [[ -n "$https_proxy" || -n "$HTTPS_PROXY" ]]; then
+        HTTPS_PROXY_ENV="${https_proxy:-$HTTPS_PROXY}"
+        log_info "Using HTTPS proxy from environment: $HTTPS_PROXY_ENV"
+    fi
+    
+    if [[ -n "$no_proxy" || -n "$NO_PROXY" ]]; then
+        NO_PROXY_ENV="${no_proxy:-$NO_PROXY}"
+        log_info "Using NO_PROXY from environment: $NO_PROXY_ENV"
+    fi
+    
+    # Check for proxy config file
+    local proxy_config="$CONFIG_DIR/proxy.conf"
+    if [[ -f "$proxy_config" ]]; then
+        log_info "Loading proxy settings from $proxy_config"
+        source "$proxy_config"
+    fi
+    
+    # Export proxy settings for subprocesses
+    export http_proxy="$HTTP_PROXY_ENV"
+    export https_proxy="$HTTPS_PROXY_ENV"
+    export no_proxy="$NO_PROXY_ENV"
+    export HTTP_PROXY="$HTTP_PROXY_ENV"
+    export HTTPS_PROXY="$HTTPS_PROXY_ENV"
+    export NO_PROXY="$NO_PROXY_ENV"
+}
+
+# Configure proxy settings
+configure_proxy() {
+    log_info "Configuring proxy settings..."
+    
+    # Prompt for proxy settings
+    read -p "HTTP Proxy URL (leave empty to skip): " http_proxy_input
+    read -p "HTTPS Proxy URL (leave empty to skip): " https_proxy_input
+    read -p "No Proxy list (leave empty for default): " no_proxy_input
+    
+    # Set default for no_proxy if empty
+    no_proxy_input=${no_proxy_input:-$NO_PROXY_ENV}
+    
+    # Save to config file
+    local proxy_config="$CONFIG_DIR/proxy.conf"
+    echo "# Proxy configuration - $(date)" > "$proxy_config"
+    [[ -n "$http_proxy_input" ]] && echo "HTTP_PROXY_ENV=\"$http_proxy_input\"" >> "$proxy_config"
+    [[ -n "$https_proxy_input" ]] && echo "HTTPS_PROXY_ENV=\"$https_proxy_input\"" >> "$proxy_config"
+    [[ -n "$no_proxy_input" ]] && echo "NO_PROXY_ENV=\"$no_proxy_input\"" >> "$proxy_config"
+    
+    log_success "Proxy settings saved to $proxy_config"
+    
+    # Reload settings
+    load_proxy_settings
+}
+
+# Configure registry mirrors
+configure_registry_mirrors() {
+    log_info "Configuring container registry mirrors..."
+    
+    # Prompt for registry mirrors
+    read -p "Docker Hub mirror URL (leave empty to skip): " dockerhub_mirror
+    read -p "Additional registry mirrors (comma-separated, leave empty to skip): " additional_mirrors
+    
+    # Combine mirrors
+    local mirrors=""
+    [[ -n "$dockerhub_mirror" ]] && mirrors="$dockerhub_mirror"
+    [[ -n "$additional_mirrors" ]] && mirrors="${mirrors:+$mirrors,}$additional_mirrors"
+    
+    # Save to config file
+    local registry_config="$CONFIG_DIR/registry.conf"
+    echo "# Registry configuration - $(date)" > "$registry_config"
+    echo "REGISTRY_MIRRORS=\"$mirrors\"" >> "$registry_config"
+    echo "INSECURE_REGISTRIES=\"$INSECURE_REGISTRIES\"" >> "$registry_config"
+    
+    log_success "Registry settings saved to $registry_config"
+    
+    # Update current settings
+    REGISTRY_MIRRORS="$mirrors"
 }
 
 # Check if command exists
@@ -286,40 +389,67 @@ fresh_install() {
     show_cluster_info
 }
 
-# Start minikube
+# Start minikube with enterprise settings
 start_minikube() {
-    log_info "Starting Minikube cluster..."
+    log_info "Starting enterprise Kubernetes cluster..."
     
-    if ! command_exists minikube; then
-        log_error "Minikube is not installed. Please run with --fresh-install first."
-        exit 1
+    # Load proxy and registry settings
+    load_proxy_settings
+    
+    # Load registry settings if available
+    local registry_config="$CONFIG_DIR/registry.conf"
+    if [[ -f "$registry_config" ]]; then
+        source "$registry_config"
     fi
     
     # Check if already running
     if minikube status -p "$PROFILE_NAME" | grep -q "Running"; then
-        log_warning "Minikube cluster is already running"
+        log_warning "Kubernetes cluster is already running"
         show_cluster_info
         return 0
     fi
     
-    # Start minikube with corporate network settings
-    log_info "Starting Minikube with corporate network settings..."
-    minikube start \
-        --driver="$MINIKUBE_DRIVER" \
-        --memory="$MINIKUBE_MEMORY" \
-        --cpus="$MINIKUBE_CPUS" \
-        --disk-size="$MINIKUBE_DISK_SIZE" \
-        --profile="$PROFILE_NAME" \
-        --insecure-registry="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16" \
-        --embed-certs=true
+    # Prepare start command with enterprise settings
+    local start_cmd="minikube start"
+    start_cmd+=" --driver=$MINIKUBE_DRIVER"
+    start_cmd+=" --memory=$MINIKUBE_MEMORY"
+    start_cmd+=" --cpus=$MINIKUBE_CPUS"
+    start_cmd+=" --disk-size=$MINIKUBE_DISK_SIZE"
+    start_cmd+=" --profile=$PROFILE_NAME"
+    start_cmd+=" --insecure-registry=\"$INSECURE_REGISTRIES\""
+    start_cmd+=" --embed-certs=true"
     
-    # Enable useful addons (with error handling for corporate networks)
-    log_info "Enabling useful addons..."
+    # Add proxy settings if configured
+    if [[ -n "$HTTP_PROXY_ENV" ]]; then
+        start_cmd+=" --docker-env=HTTP_PROXY=$HTTP_PROXY_ENV"
+    fi
+    if [[ -n "$HTTPS_PROXY_ENV" ]]; then
+        start_cmd+=" --docker-env=HTTPS_PROXY=$HTTPS_PROXY_ENV"
+    fi
+    if [[ -n "$NO_PROXY_ENV" ]]; then
+        start_cmd+=" --docker-env=NO_PROXY=$NO_PROXY_ENV"
+    fi
+    
+    # Add registry mirrors if configured
+    if [[ -n "$REGISTRY_MIRRORS" ]]; then
+        IFS=',' read -ra MIRRORS <<< "$REGISTRY_MIRRORS"
+        for mirror in "${MIRRORS[@]}"; do
+            start_cmd+=" --registry-mirror=$mirror"
+        done
+    fi
+    
+    # Start the cluster
+    log_info "Starting Kubernetes cluster with enterprise settings..."
+    eval "$start_cmd"
+    
+    # Enable useful addons with error handling
+    log_info "Enabling enterprise addons..."
     minikube addons enable dashboard -p "$PROFILE_NAME" || log_warning "Failed to enable dashboard addon"
     minikube addons enable metrics-server -p "$PROFILE_NAME" || log_warning "Failed to enable metrics-server addon"
     minikube addons enable ingress -p "$PROFILE_NAME" || log_warning "Failed to enable ingress addon"
+    minikube addons enable registry -p "$PROFILE_NAME" || log_warning "Failed to enable registry addon"
     
-    log_success "Minikube cluster started successfully!"
+    log_success "Enterprise Kubernetes cluster started successfully!"
     show_cluster_info
 }
 
@@ -389,7 +519,7 @@ show_cluster_info() {
 # Show help
 show_help() {
     cat << EOF
-Minikube Management CLI Tool
+Enterprise Kubernetes Local Cluster Management Tool
 
 USAGE:
     $0 [COMMAND] [OPTIONS]
@@ -401,19 +531,21 @@ COMMANDS:
     delete             Delete the Minikube cluster
     status             Show cluster status and information
     install-docker     Install Docker only (Ubuntu/Debian)
+    configure-proxy    Configure proxy settings
+    configure-registry Configure container registry mirrors
     help               Show this help message
 
 OPTIONS:
     --driver DRIVER         Set the driver (docker, virtualbox, kvm2, etc.) [default: docker]
-    --memory MEMORY         Set memory allocation in MB [default: 4096]
-    --cpus CPUS            Set number of CPUs [default: 2]
-    --disk-size SIZE       Set disk size [default: 20g]
-    --profile NAME         Set profile name [default: minikube]
+    --memory MEMORY         Set memory allocation in MB [default: 8192]
+    --cpus CPUS            Set number of CPUs [default: 4]
+    --disk-size SIZE       Set disk size [default: 40g]
+    --profile NAME         Set profile name [default: enterprise-k8s]
     --kubectl-version VER  Set specific kubectl version [default: latest stable]
 
 EXAMPLES:
     $0 fresh-install                           # Fresh installation with Docker, Minikube, kubectl
-    $0 fresh-install --memory 8192 --cpus 4   # Fresh install with more resources
+    $0 fresh-install --memory 16384 --cpus 8  # Fresh install with more resources
     $0 install-docker                          # Install Docker only
     $0 start --driver virtualbox              # Start with VirtualBox driver
     $0 status                                  # Show cluster status
@@ -459,7 +591,7 @@ parse_args() {
     done
 }
 
-# Main function
+# Main function with enterprise commands
 main() {
     if [[ $# -eq 0 ]]; then
         show_help
@@ -491,6 +623,12 @@ main() {
         install-docker)
             check_os_support
             install_docker
+            ;;
+        configure-proxy)
+            configure_proxy
+            ;;
+        configure-registry)
+            configure_registry_mirrors
             ;;
         help|--help|-h)
             show_help
