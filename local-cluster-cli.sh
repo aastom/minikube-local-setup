@@ -234,7 +234,7 @@ install_kubectl() {
         local kubectl_version=$(curl $CURL_FLAGS -s "$version_url")
         if [[ -z "$kubectl_version" ]]; then
             log_warning "Could not fetch latest version, using fallback version"
-            kubectl_version="v1.30.0"  # Fallback version
+            kubectl_version="v1.31.0"  # Updated fallback to latest stable
         fi
     fi
     
