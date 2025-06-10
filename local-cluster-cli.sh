@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Minikube Management CLI Tool for SOI
-# Usage: ./minikube-manager.sh [COMMAND] [OPTIONS]
+# Usage: ./local-cluster.sh [COMMAND] [OPTIONS]
 
 set -e
 
