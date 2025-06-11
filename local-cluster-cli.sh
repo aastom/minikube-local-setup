@@ -263,7 +263,7 @@ check_requirements() {
     log_success "System requirements check passed"
 }
 
-# Install or update minikube
+# Install or update minikube with enterprise mirror support
 install_minikube() {
     log_info "Installing/updating Minikube..."
     
@@ -283,18 +283,40 @@ install_minikube() {
     esac
     
     # Download and install minikube
-    local minikube_url="https://storage.googleapis.com/minikube/releases/latest/minikube-${os}-${arch}"
-    local install_dir="/usr/local/bin"
+    local minikube_binary="minikube-${os}-${arch}"
+    local minikube_url
     
-    log_info "Downloading Minikube binary..."
-    if [[ ! -w "$install_dir" ]]; then
-        log_info "Installing to $install_dir requires sudo privileges"
-        sudo wget $WGET_FLAGS -O "$install_dir/minikube" "$minikube_url"
-        sudo chmod +x "$install_dir/minikube"
+    # Check if enterprise mirror is configured
+    if [[ -n "$ENTERPRISE_MIRROR" ]]; then
+        minikube_url="${ENTERPRISE_MIRROR}/minikube/releases/latest/download/${minikube_binary}"
+        log_info "Using enterprise mirror for Minikube: $minikube_url"
     else
-        wget $WGET_FLAGS -O "$install_dir/minikube" "$minikube_url"
-        chmod +x "$install_dir/minikube"
+        minikube_url="https://github.com/kubernetes/minikube/releases/latest/download/${minikube_binary}"
     fi
+    
+    # Try to download from configured source
+    log_info "Downloading Minikube binary from $minikube_url..."
+    if ! wget $WGET_FLAGS -O "${minikube_binary}" "$minikube_url"; then
+        # If download fails, try alternative method - local file
+        log_warning "Download failed. Checking for local minikube binary..."
+        if [[ -f "$CONFIG_DIR/${minikube_binary}" ]]; then
+            log_info "Found local minikube binary. Installing..."
+            cp "$CONFIG_DIR/${minikube_binary}" "./${minikube_binary}"
+        else
+            log_error "No local minikube binary found."
+            log_info "Please manually download minikube and place it at:"
+            log_info "$CONFIG_DIR/${minikube_binary}"
+            log_info "Then run this command again."
+            exit 1
+        fi
+    fi
+    
+    # Install the binary
+    log_info "Installing minikube to /usr/local/bin/minikube..."
+    sudo install "${minikube_binary}" /usr/local/bin/minikube
+    
+    # Clean up the downloaded binary
+    rm -f "${minikube_binary}"
     
     log_success "Minikube installed successfully"
 }
