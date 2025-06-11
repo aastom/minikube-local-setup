@@ -16,9 +16,9 @@ NC='\033[0m' # No Color
 WGET_FLAGS="--no-check-certificate --timeout=60 --tries=5 --retry-connrefused"
 CURL_FLAGS="--insecure --connect-timeout 60 --retry 5 --retry-connrefused"
 APT_FLAGS="-o Acquire::https::Verify-Peer=false -o Acquire::https::Verify-Host=false"
-MINIKUBE_MEMORY="8192"
+MINIKUBE_MEMORY="2200"
 MINIKUBE_CPUS="2"
-MINIKUBE_DISK_SIZE="40g"
+MINIKUBE_DISK_SIZE="50g"
 MINIKUBE_DRIVER="docker"
 KUBECTL_VERSION="v1.31.1"
 PROFILE_NAME="enterprise-k8s"
@@ -63,22 +63,31 @@ configure_registry_mirrors() {
     # Prompt for registry mirrors
     read -p "Docker Hub mirror URL (leave empty to skip): " dockerhub_mirror
     read -p "Additional registry mirrors (comma-separated, leave empty to skip): " additional_mirrors
+    read -p "Kubernetes image registry (default: k8s.gcr.io): " k8s_registry
+    read -p "Custom image repository prefix (leave empty to use default): " image_repository
     
     # Combine mirrors
     local mirrors=""
     [[ -n "$dockerhub_mirror" ]] && mirrors="$dockerhub_mirror"
     [[ -n "$additional_mirrors" ]] && mirrors="${mirrors:+$mirrors,}$additional_mirrors"
     
+    # Set default for Kubernetes registry if empty
+    [[ -z "$k8s_registry" ]] && k8s_registry="k8s.gcr.io"
+    
     # Save to config file
     local registry_config="$CONFIG_DIR/registry.conf"
     echo "# Registry configuration - $(date)" > "$registry_config"
     echo "REGISTRY_MIRRORS=\"$mirrors\"" >> "$registry_config"
     echo "INSECURE_REGISTRIES=\"$INSECURE_REGISTRIES\"" >> "$registry_config"
+    echo "K8S_REGISTRY=\"$k8s_registry\"" >> "$registry_config"
+    echo "IMAGE_REPOSITORY=\"$image_repository\"" >> "$registry_config"
     
     log_success "Registry settings saved to $registry_config"
     
     # Update current settings
     REGISTRY_MIRRORS="$mirrors"
+    K8S_REGISTRY="$k8s_registry"
+    IMAGE_REPOSITORY="$image_repository"
 }
 
 # Start minikube with enterprise settings
@@ -114,6 +123,16 @@ start_minikube() {
         for mirror in "${MIRRORS[@]}"; do
             start_cmd+=" --registry-mirror=$mirror"
         done
+    fi
+    
+    # Add custom Kubernetes image registry if configured
+    if [[ -n "$K8S_REGISTRY" && "$K8S_REGISTRY" != "k8s.gcr.io" ]]; then
+        start_cmd+=" --image-repository=\"$K8S_REGISTRY\""
+    fi
+    
+    # Add custom image repository prefix if configured
+    if [[ -n "$IMAGE_REPOSITORY" ]]; then
+        start_cmd+=" --image-repository=\"$IMAGE_REPOSITORY\""
     fi
     
     # Start the cluster
@@ -479,8 +498,8 @@ COMMANDS:
     delete             Delete the Minikube cluster
     status             Show cluster status and information
     install-docker     Install Docker only (Ubuntu/Debian)
-    configure-registry Configure container registry mirrors
-    configure-mirror   Configure enterprise mirror
+    configure-registry Configure container registry mirrors and Kubernetes image repository
+    configure-mirror   Configure enterprise mirror for binaries
     help               Show this help message
 
 OPTIONS:
@@ -490,6 +509,7 @@ OPTIONS:
     --disk-size SIZE       Set disk size [default: 40g]
     --profile NAME         Set profile name [default: enterprise-k8s]
     --kubectl-version VER  Set specific kubectl version [default: latest stable]
+    --image-repository REPO Set custom image repository for Kubernetes components
 
 EXAMPLES:
     $0 fresh-install                           # Fresh installation with Docker, Minikube, kubectl
@@ -498,6 +518,8 @@ EXAMPLES:
     $0 start --driver virtualbox              # Start with VirtualBox driver
     $0 status                                  # Show cluster status
     $0 delete --profile my-cluster            # Delete specific profile
+    $0 configure-registry                      # Configure registry mirrors and Kubernetes image repository
+    $0 start --image-repository registry.internal.company.com/k8s # Use custom registry
 
 EOF
 }
@@ -528,6 +550,10 @@ parse_args() {
                 ;;
             --kubectl-version)
                 KUBECTL_VERSION="$2"
+                shift 2
+                ;;
+            --image-repository)
+                IMAGE_REPOSITORY="$2"
                 shift 2
                 ;;
             *)
