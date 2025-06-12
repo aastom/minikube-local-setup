@@ -341,6 +341,17 @@ pre_pull_images() {
         "storage-provisioner:$(get_image_url "storage-provisioner" "$STORAGE_PROVISIONER_IMAGE" "storage-provisioner" "$STORAGE_PROVISIONER_VERSION")"
     )
     
+    # Also pre-pull kicbase if specified
+    if [[ -n "$KICBASE_IMAGE" ]]; then
+        log_info "Pre-pulling kicbase: $KICBASE_IMAGE"
+        if ! docker pull "$KICBASE_IMAGE" 2>/dev/null; then
+            log_warning "Failed to pull kicbase image: $KICBASE_IMAGE"
+            log_info "Minikube will attempt to download it during cluster start"
+        else
+            log_success "Successfully pre-pulled kicbase: $KICBASE_IMAGE"
+        fi
+    fi
+    
     for image_spec in "${images[@]}"; do
         local component="${image_spec%%:*}"
         local image_url="${image_spec#*:}"
@@ -351,16 +362,25 @@ pre_pull_images() {
             log_warning "Failed to pull $image_url, trying fallback registries"
             
             # Try alternative registries for standard images
-            local base_image="${component}:${image_url##*:}"
+            local component_name="${component}"
+            local version="${image_url##*:}"
+            local fallback_attempted=false
+            
             for alt_reg in "k8s.gcr.io" "gcr.io/k8s-minikube" "$DEFAULT_REGISTRY"; do
-                local alt_image="${alt_reg}/${base_image}"
-                log_info "Trying: $alt_image"
+                local alt_image="${alt_reg}/${component_name}:${version}"
+                log_info "Trying fallback: $alt_image"
                 if docker pull "$alt_image" 2>/dev/null; then
                     docker tag "$alt_image" "$image_url" 2>/dev/null || true
-                    log_success "Tagged $alt_image as $image_url"
+                    log_success "Tagged fallback $alt_image as $image_url"
+                    fallback_attempted=true
                     break
                 fi
             done
+            
+            if [[ "$fallback_attempted" != true ]]; then
+                log_warning "All fallback attempts failed for $component"
+                log_info "Minikube will attempt to download it during cluster start"
+            fi
         else
             log_success "Successfully pulled $image_url"
         fi
@@ -381,14 +401,16 @@ start_minikube() {
         return 0
     fi
     
-    # Pre-pull images
+    # Check if Docker is accessible and try to pre-pull images
     if docker info >/dev/null 2>&1; then
+        log_info "Docker is accessible, attempting to pre-pull images..."
         pre_pull_images
     else
         log_warning "Docker not accessible, skipping image pre-pull"
+        log_info "Images will be downloaded during cluster start"
     fi
     
-    # Build minikube start command
+    # Build minikube start command with shorter, validated parameters
     local start_cmd="minikube start"
     start_cmd+=" --driver=$MINIKUBE_DRIVER"
     start_cmd+=" --memory=$MINIKUBE_MEMORY"
@@ -397,48 +419,69 @@ start_minikube() {
     start_cmd+=" --profile=$PROFILE_NAME"
     start_cmd+=" --insecure-registry=\"$INSECURE_REGISTRIES\""
     start_cmd+=" --embed-certs=true"
+    start_cmd+=" --delete-on-failure"
     
-    # Add custom kicbase image if specified
+    # Add custom kicbase image if specified and validate it
     if [[ -n "$KICBASE_IMAGE" ]]; then
+        # Validate kicbase image URL length (minikube has limits)
+        if [[ ${#KICBASE_IMAGE} -gt 200 ]]; then
+            log_warning "Kicbase image URL is very long (${#KICBASE_IMAGE} chars), this may cause issues"
+            log_warning "Consider using a shorter registry path or image name"
+        fi
         start_cmd+=" --base-image=\"$KICBASE_IMAGE\""
         log_info "Using custom kicbase image: $KICBASE_IMAGE"
+    else
+        log_info "Using default kicbase image"
     fi
     
-    # Add individual image overrides
+    # Add individual image overrides with validation
+    local image_overrides_count=0
+    
     if [[ -n "$PAUSE_IMAGE" ]]; then
         start_cmd+=" --extra-config=kubelet.pod-infra-container-image=\"$PAUSE_IMAGE\""
         log_info "Using custom pause image: $PAUSE_IMAGE"
+        ((image_overrides_count++))
     fi
     
-    # Add custom apiserver image
     if [[ -n "$KUBE_APISERVER_IMAGE" ]]; then
         start_cmd+=" --extra-config=apiserver.image=\"$KUBE_APISERVER_IMAGE\""
         log_info "Using custom apiserver image: $KUBE_APISERVER_IMAGE"
+        ((image_overrides_count++))
     fi
     
-    # Add custom controller-manager image
     if [[ -n "$KUBE_CONTROLLER_MANAGER_IMAGE" ]]; then
         start_cmd+=" --extra-config=controller-manager.image=\"$KUBE_CONTROLLER_MANAGER_IMAGE\""
         log_info "Using custom controller-manager image: $KUBE_CONTROLLER_MANAGER_IMAGE"
+        ((image_overrides_count++))
     fi
     
-    # Add custom scheduler image
     if [[ -n "$KUBE_SCHEDULER_IMAGE" ]]; then
         start_cmd+=" --extra-config=scheduler.image=\"$KUBE_SCHEDULER_IMAGE\""
         log_info "Using custom scheduler image: $KUBE_SCHEDULER_IMAGE"
+        ((image_overrides_count++))
     fi
     
-    # Add custom etcd image
     if [[ -n "$ETCD_IMAGE" ]]; then
         start_cmd+=" --extra-config=etcd.image=\"$ETCD_IMAGE\""
         log_info "Using custom etcd image: $ETCD_IMAGE"
+        ((image_overrides_count++))
     fi
     
-    # Note: storage-provisioner image is controlled via different mechanism
-    # It's handled by minikube addons, not via extra-config
+    # Note: storage-provisioner and coredns are handled post-startup
     if [[ -n "$STORAGE_PROVISIONER_IMAGE" ]]; then
         log_info "Custom storage-provisioner image specified: $STORAGE_PROVISIONER_IMAGE"
         log_info "Will configure storage-provisioner after cluster starts"
+    fi
+    
+    if [[ -n "$COREDNS_IMAGE" ]]; then
+        log_info "Custom coredns image specified: $COREDNS_IMAGE"
+        log_info "Will configure coredns after cluster starts"
+    fi
+    
+    if [[ $image_overrides_count -gt 0 ]]; then
+        log_info "Total custom images configured: $image_overrides_count"
+    else
+        log_info "Using default images from $DEFAULT_REGISTRY"
     fi
     
     # Start cluster with retry logic
