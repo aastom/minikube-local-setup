@@ -29,10 +29,47 @@ CUSTOM_COREDNS_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al0
 CUSTOM_STORAGE_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/gcr.io/k8s-minikube/storage-provisioner:v5_6e38f40d628d"
 CUSTOM_KICBASE_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/gcr.io/k8s-minikube/kicbase:v0.0.47"
 
-log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+# Check if Docker is running and start if needed
+ensure_docker_running() {
+    log_info "Checking Docker status..."
+    
+    if docker info >/dev/null 2>&1; then
+        log_success "Docker is already running"
+        return 0
+    fi
+    
+    log_info "Docker is not running, attempting to start..."
+    
+    # Try to start Docker using the service script
+    if command -v docker-service >/dev/null 2>&1; then
+        if docker-service start; then
+            log_success "Docker started successfully"
+            return 0
+        fi
+    fi
+    
+    # Fallback: try to start dockerd directly
+    log_info "Trying to start Docker daemon directly..."
+    if sudo dockerd >/dev/null 2>&1 & then
+        # Wait for Docker to start
+        local count=0
+        while ! docker info >/dev/null 2>&1; do
+            sleep 1
+            count=$((count + 1))
+            if [ $count -gt 30 ]; then
+                log_error "Docker failed to start within 30 seconds"
+                return 1
+            fi
+        done
+        log_success "Docker started successfully"
+        return 0
+    fi
+    
+    log_error "Failed to start Docker"
+    log_info "Please ensure Docker is installed and you have the necessary permissions"
+    log_info "Try running: sudo apt install docker.io && sudo usermod -aG docker \$USER"
+    return 1
+}
 
 # Function to extract tag from image URL (handles complex URLs with multiple colons)
 extract_tag() {
@@ -83,6 +120,12 @@ extract_repo() {
 # Function to pull and tag images
 pull_and_tag_images() {
     log_info "=== STEP 1: PULLING AND TAGGING IMAGES ==="
+    
+    # Ensure Docker is running
+    if ! ensure_docker_running; then
+        log_error "Cannot proceed without Docker"
+        return 1
+    fi
     
     # Extract actual tags from custom images or use sensible defaults
     local pause_tag="3.9"
@@ -365,6 +408,17 @@ EXAMPLES:
     $0 start      # Just start cluster
     $0 load       # Load images into running cluster
     $0 clean      # Clean up everything
+
+PREREQUISITES:
+    Before using this script, install Docker on Ubuntu WSL:
+    
+    1. Download the Docker setup script
+    2. Run: chmod +x docker-setup.sh
+    3. Run: ./docker-setup.sh install
+    4. Start new terminal or run: newgrp docker
+    5. Start Docker: docker-service start
+    
+    Then you can use this minikube script.
 
 EOF
 }
