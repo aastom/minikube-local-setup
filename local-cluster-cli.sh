@@ -1,10 +1,3 @@
-configure-registry Configure container registry mirrors and Kubernetes image repository
-    configure-mirror   Configure enterprise mirror for binaries
-    configure-docker-url Configure Docker Desktop connection via URL/TCP
-    setup-windows-docker Setup Windows Docker.exe wrapper for WSL (WSL only)
-    fix-docker         Fix Docker service issues
-    troubleshoot       Run diagnostics and show troubleshooting information
-    help               Show this help message#!/bin/bash
 
 # Enterprise Kubernetes Local Cluster Management Tool
 # Usage: ./local-cluster-cli.sh [COMMAND] [OPTIONS]
@@ -22,9 +15,12 @@ NC='\033[0m' # No Color
 WGET_FLAGS="--no-check-certificate --timeout=60 --tries=5 --retry-connrefused"
 CURL_FLAGS="--insecure --connect-timeout 60 --retry 5 --retry-connrefused"
 APT_FLAGS="-o Acquire::https::Verify-Peer=false -o Acquire::https::Verify-Host=false"
-MINIKUBE_MEMORY="4096"  # Increased default memory
+HTTP_PROXY_ENV=""
+HTTPS_PROXY_ENV=""
+NO_PROXY_ENV="localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local,.internal"
+MINIKUBE_MEMORY="8192"
 MINIKUBE_CPUS="2"
-MINIKUBE_DISK_SIZE="50g"
+MINIKUBE_DISK_SIZE="40g"
 MINIKUBE_DRIVER="docker"
 KUBECTL_VERSION="v1.31.1"
 PROFILE_NAME="enterprise-k8s"
@@ -1520,7 +1516,6 @@ WSL/DOCKER DESKTOP NOTES:
 
 EOF
 }
-}
 
 # Parse command line arguments
 parse_args() {
@@ -1596,7 +1591,7 @@ configure_mirror() {
     fi
 }
 
-# Main function with enterprise commands and better error handling
+# Main function with enterprise commands
 main() {
     # Set up error handling
     trap cleanup_failed_install ERR
@@ -1631,32 +1626,17 @@ main() {
         status)
             show_cluster_info
             ;;
-        install-docker)
-            check_os_support
-            install_docker
+        install-minikube)
+            install_minikube
+            ;;
+        install-kubectl)
+            install_kubectl
             ;;
         configure-registry)
             configure_registry_mirrors
             ;;
         configure-mirror)
             configure_mirror
-            ;;
-        configure-docker-url)
-            configure_docker_desktop_url
-            ;;
-        setup-windows-docker)
-            if is_wsl; then
-                setup_windows_docker
-            else
-                log_error "This command only works in WSL environment"
-                exit 1
-            fi
-            ;;
-        fix-docker)
-            fix_docker_service
-            ;;
-        troubleshoot)
-            troubleshoot
             ;;
         help|--help|-h)
             show_help
@@ -1669,5 +1649,23 @@ main() {
     esac
 }
 
-# Run main function with all arguments
+# Check OS support
+check_os_support() {
+    log_info "Checking OS support..."
+    
+    # Check if running in WSL
+    if is_wsl; then
+        log_info "Running in WSL environment"
+    fi
+    
+    # Check OS type
+    if [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+        log_info "Detected OS: $NAME $VERSION_ID"
+    else
+        log_warning "Could not determine OS type"
+    fi
+}
+
+# Execute main function
 main "$@"
