@@ -1,4 +1,10 @@
-#!/bin/bash
+configure-registry Configure container registry mirrors and Kubernetes image repository
+    configure-mirror   Configure enterprise mirror for binaries
+    configure-docker-url Configure Docker Desktop connection via URL/TCP
+    setup-windows-docker Setup Windows Docker.exe wrapper for WSL (WSL only)
+    fix-docker         Fix Docker service issues
+    troubleshoot       Run diagnostics and show troubleshooting information
+    help               Show this help message#!/bin/bash
 
 # Enterprise Kubernetes Local Cluster Management Tool
 # Usage: ./local-cluster-cli.sh [COMMAND] [OPTIONS]
@@ -63,15 +69,117 @@ is_wsl() {
     [[ -n "${WSL_DISTRO_NAME:-}" ]] || [[ -n "${WSL_INTEROP:-}" ]] || [[ -f /proc/sys/fs/binfmt_misc/WSLInterop ]] || grep -qi microsoft /proc/version 2>/dev/null
 }
 
-# Check if Docker Desktop is available
-is_docker_desktop() {
-    # Check if we're in WSL and Docker Desktop socket is available
-    if is_wsl; then
-        # Docker Desktop in WSL2 typically uses /var/run/docker.sock or Docker Desktop's socket
-        [[ -S /var/run/docker.sock ]] || [[ -S /mnt/wsl/shared-docker/docker.sock ]] || [[ -S "$HOME/.docker/desktop/docker.sock" ]]
+# Configure Docker Desktop connection via URL/TCP
+configure_docker_desktop_url() {
+    log_info "Configuring Docker Desktop connection via URL..."
+    
+    # Check if TCP connection is available
+    local docker_tcp_host="tcp://localhost:2375"
+    local docker_tcp_tls_host="tcp://localhost:2376"
+    
+    # Test TCP connection (non-TLS)
+    if DOCKER_HOST="$docker_tcp_host" docker info >/dev/null 2>&1; then
+        log_success "Docker Desktop TCP connection (non-TLS) is available"
+        export DOCKER_HOST="$docker_tcp_host"
+        echo "export DOCKER_HOST=\"$docker_tcp_host\"" >> ~/.bashrc
+        log_info "Set DOCKER_HOST to $docker_tcp_host"
+        return 0
+    fi
+    
+    # Test TCP connection (TLS)
+    if DOCKER_HOST="$docker_tcp_tls_host" docker info >/dev/null 2>&1; then
+        log_success "Docker Desktop TCP connection (TLS) is available"
+        export DOCKER_HOST="$docker_tcp_tls_host"
+        echo "export DOCKER_HOST=\"$docker_tcp_tls_host\"" >> ~/.bashrc
+        log_info "Set DOCKER_HOST to $docker_tcp_tls_host"
+        return 0
+    fi
+    
+    # Check various socket locations
+    local socket_locations=(
+        "unix:///var/run/docker.sock"
+        "unix:///mnt/wsl/shared-docker/docker.sock"
+        "unix://$HOME/.docker/desktop/docker.sock"
+    )
+    
+    for socket in "${socket_locations[@]}"; do
+        if DOCKER_HOST="$socket" docker info >/dev/null 2>&1; then
+            log_success "Docker socket found at: $socket"
+            export DOCKER_HOST="$socket"
+            echo "export DOCKER_HOST=\"$socket\"" >> ~/.bashrc
+            log_info "Set DOCKER_HOST to $socket"
+            return 0
+        fi
+    done
+    
+    log_error "No working Docker connection found"
+    log_info "To enable TCP connection:"
+    log_info "1. Open Docker Desktop"
+    log_info "2. Go to Settings > General"
+    log_info "3. Enable 'Expose daemon on tcp://localhost:2375 without TLS'"
+    log_info "4. Apply & Restart"
+    return 1
+}
+
+# Check if Docker Desktop is available via URL
+is_docker_desktop_url() {
+    # Check if DOCKER_HOST is set to a Docker Desktop endpoint
+    [[ -n "${DOCKER_HOST:-}" ]] && (
+        [[ "${DOCKER_HOST}" == *"localhost:2375"* ]] || 
+        [[ "${DOCKER_HOST}" == *"localhost:2376"* ]] ||
+        [[ "${DOCKER_HOST}" == *"docker.sock"* ]]
+    )
+}
+
+# Check if Docker Desktop WSL integration is working properly
+check_docker_desktop_integration() {
+    if ! is_wsl; then
+        return 0  # Not in WSL, skip check
+    fi
+    
+    log_info "Checking Docker Desktop integration options..."
+    
+    # First, try Windows Docker.exe directly
+    if check_windows_docker; then
+        log_info "Windows Docker.exe found, testing connectivity..."
+        if "$WINDOWS_DOCKER_PATH" info >/dev/null 2>&1; then
+            log_success "Windows Docker.exe is working - using direct Windows Docker"
+            setup_windows_docker
+            return 0
+        else
+            log_warning "Windows Docker.exe found but not accessible"
+        fi
+    fi
+    
+    # Check if Docker Desktop is installed on Windows
+    if [[ ! -f "/mnt/c/Program Files/Docker/Docker/Docker Desktop.exe" ]]; then
+        log_warning "Docker Desktop not found on Windows host"
+        return 1
+    fi
+    
+    # Test basic Docker connectivity via WSL integration
+    if docker_info_wrapper >/dev/null 2>&1; then
+        log_success "Docker Desktop WSL integration is working"
+        return 0
     else
-        # On Windows with Docker Desktop, check for typical indicators
-        [[ -n "${DOCKER_HOST:-}" ]] && [[ "${DOCKER_HOST}" == *"docker-desktop"* ]]
+        log_error "Docker Desktop WSL integration is not working"
+        log_info "Will attempt to use Windows Docker.exe directly"
+        
+        if check_windows_docker && setup_windows_docker; then
+            log_success "Successfully configured Windows Docker.exe wrapper"
+            return 0
+        else
+            log_error "Both WSL integration and Windows Docker.exe failed"
+            log_info "Common fixes:"
+            log_info "1. Open Docker Desktop and restart WSL integration"
+            log_info "2. Go to Settings > Resources > WSL Integration"
+            log_info "3. Disable and re-enable integration with your distro"
+            log_info "4. If that fails, run these commands in Windows PowerShell as Administrator:"
+            log_info "   wsl --shutdown"
+            log_info "   wsl --start ${WSL_DISTRO_NAME:-Ubuntu}"
+            log_info "5. Restart Docker Desktop"
+            return 1
+        fi
     fi
 }
 
@@ -84,13 +192,11 @@ configure_docker_desktop() {
         return 1
     fi
     
-    # Check if Docker Desktop is running
-    if ! docker info >/dev/null 2>&1; then
-        log_error "Docker Desktop is not running or not accessible from WSL"
-        log_info "Please ensure:"
-        log_info "1. Docker Desktop is running on Windows"
-        log_info "2. WSL 2 integration is enabled in Docker Desktop settings"
-        log_info "3. Your WSL distro is enabled in Docker Desktop > Settings > Resources > WSL Integration"
+    # Check Docker Desktop integration status first
+    if ! check_docker_desktop_integration; then
+        log_error "Docker Desktop WSL integration is not working properly"
+        log_info "Please fix the integration issue before continuing"
+        log_info "You may need to restart Docker Desktop or reset WSL integration"
         return 1
     fi
     
@@ -194,8 +300,8 @@ pre_pull_images() {
         "coredns:v1.11.1"
     )
     
-    # Try to pre-pull images using docker
-    if command_exists docker && docker info >/dev/null 2>&1; then
+    # Try to pre-pull images using docker (with wrapper support)
+    if command_exists docker && docker_info_wrapper >/dev/null 2>&1; then
         for image in "${images[@]}"; do
             local full_image=""
             if [[ -n "$IMAGE_REPOSITORY" ]]; then
@@ -205,16 +311,18 @@ pre_pull_images() {
             fi
             
             log_info "Attempting to pull image: $full_image"
-            if ! docker pull "$full_image" 2>/dev/null; then
+            if ! docker_pull_wrapper "$full_image" 2>/dev/null; then
                 log_warning "Failed to pull $full_image, will try fallback during cluster start"
                 # Try alternative registries
                 local alt_registries=("k8s.gcr.io" "gcr.io/k8s-minikube")
                 for alt_reg in "${alt_registries[@]}"; do
                     local alt_image="${alt_reg}/${image}"
                     log_info "Trying alternative registry: $alt_image"
-                    if docker pull "$alt_image" 2>/dev/null; then
-                        # Tag the image for the expected repository
-                        docker tag "$alt_image" "$full_image" 2>/dev/null || true
+                    if docker_pull_wrapper "$alt_image" 2>/dev/null; then
+                        # Tag the image for the expected repository (if using regular docker)
+                        if ! is_wsl || [[ -z "${WINDOWS_DOCKER_PATH:-}" ]]; then
+                            docker tag "$alt_image" "$full_image" 2>/dev/null || true
+                        fi
                         break
                     fi
                 done
@@ -476,8 +584,15 @@ start_minikube() {
     fi
     
     # Configure Docker daemon for insecure registries with error handling
-    if docker info >/dev/null 2>&1; then
-        if is_docker_desktop; then
+    if docker_info_wrapper >/dev/null 2>&1; then
+        if is_wsl && [[ -n "${WINDOWS_DOCKER_PATH:-}" ]]; then
+            log_info "Using Windows Docker.exe - registry configuration handled by Docker Desktop"
+            log_warning "To configure insecure registries:"
+            log_info "1. Open Docker Desktop on Windows"
+            log_info "2. Go to Settings > Docker Engine"
+            log_info "3. Add insecure registries to the JSON configuration"
+            log_info "4. Apply & Restart Docker Desktop"
+        elif is_docker_desktop; then
             log_info "Docker Desktop detected - using Desktop-specific configuration"
             if configure_docker_desktop; then
                 log_success "Docker Desktop configuration completed"
@@ -629,8 +744,17 @@ install_docker() {
     if is_wsl; then
         log_info "WSL environment detected"
         
-        # Check if Docker Desktop is already accessible
-        if docker info >/dev/null 2>&1; then
+        # First, try to use Windows Docker directly
+        if check_windows_docker; then
+            log_info "Windows Docker.exe found, setting up direct access..."
+            if setup_windows_docker; then
+                log_success "Windows Docker.exe configured successfully"
+                return 0
+            fi
+        fi
+        
+        # Check if Docker Desktop is already accessible via WSL integration
+        if docker_info_wrapper >/dev/null 2>&1; then
             log_success "Docker Desktop is already accessible from WSL"
             configure_docker_desktop
             return 0
@@ -639,13 +763,19 @@ install_docker() {
         # Check if Docker Desktop might be installed but not configured
         if [[ -f "/mnt/c/Program Files/Docker/Docker/Docker Desktop.exe" ]] || [[ -f "/mnt/c/ProgramData/Docker/config/daemon.json" ]]; then
             log_warning "Docker Desktop appears to be installed on Windows but not accessible from WSL"
+            
+            # Try Windows Docker.exe as fallback
+            if check_windows_docker && setup_windows_docker; then
+                log_success "Configured Windows Docker.exe as fallback"
+                return 0
+            fi
+            
             log_info "Please enable WSL 2 integration in Docker Desktop:"
             log_info "1. Open Docker Desktop on Windows"
             log_info "2. Go to Settings > Resources > WSL Integration"
             log_info "3. Enable integration with your WSL distro"
             log_info "4. Apply & Restart Docker Desktop"
-            log_info "Then run this script again"
-            return 1
+            log_info "Alternatively, the script will try to install native Docker in WSL"
         fi
         
         log_info "Docker Desktop not found. You can either:"
@@ -664,7 +794,7 @@ install_docker() {
     if command_exists docker; then
         log_info "Docker is already installed"
         # Check if docker daemon is running
-        if docker info >/dev/null 2>&1; then
+        if docker_info_wrapper >/dev/null 2>&1; then
             log_success "Docker is installed and running"
             if is_wsl; then
                 configure_docker_desktop
@@ -788,10 +918,28 @@ check_requirements() {
         if ! command_exists docker; then
             log_info "Docker not found. Installing Docker..."
             install_docker
-        elif ! docker info >/dev/null 2>&1; then
-            if is_wsl && is_docker_desktop; then
-                log_info "Docker Desktop detected but not accessible. Checking integration..."
-                log_warning "Please ensure WSL integration is enabled in Docker Desktop settings"
+        elif ! docker_info_wrapper >/dev/null 2>&1; then
+            if is_wsl; then
+                log_info "Docker not accessible in WSL, checking integration options..."
+                
+                # Try Windows Docker.exe first
+                if check_windows_docker && setup_windows_docker; then
+                    log_success "Configured Windows Docker.exe successfully"
+                elif is_docker_desktop; then
+                    log_info "Docker Desktop detected but not accessible. Checking integration..."
+                    log_warning "Please ensure WSL integration is enabled in Docker Desktop settings"
+                else
+                    log_info "Docker is installed but not accessible. Checking permissions..."
+                    if ! groups "$USER" | grep -q docker; then
+                        log_warning "User is not in docker group. Adding user to docker group..."
+                        sudo usermod -aG docker "$USER"
+                        log_warning "Please logout and login again, then re-run this script"
+                        exit 1
+                    else
+                        log_info "Starting Docker service..."
+                        sudo systemctl start docker
+                    fi
+                fi
             else
                 log_info "Docker is installed but not accessible. Checking permissions..."
                 if ! groups "$USER" | grep -q docker; then
@@ -806,7 +954,9 @@ check_requirements() {
             fi
         else
             log_success "Docker is accessible"
-            if is_docker_desktop; then
+            if is_wsl && [[ -n "${WINDOWS_DOCKER_PATH:-}" ]]; then
+                log_info "Using Windows Docker.exe"
+            elif is_docker_desktop; then
                 log_info "Using Docker Desktop"
             else
                 log_info "Using native Docker installation"
@@ -1178,14 +1328,24 @@ troubleshoot() {
         echo "Docker Desktop Integration:"
         if [[ -f "/mnt/c/Program Files/Docker/Docker/Docker Desktop.exe" ]]; then
             echo "  ✓ Docker Desktop found on Windows"
+            
+            # Test WSL integration
+            if docker info >/dev/null 2>&1; then
+                echo "  ✓ Docker socket accessible in WSL"
+            else
+                echo "  ✗ Docker socket not accessible in WSL"
+                echo "  ⚠ WSL integration may need to be restarted in Docker Desktop"
+            fi
+            
+            # Check for common WSL integration issues
+            if docker version >/dev/null 2>&1; then
+                echo "  ✓ Docker commands work properly"
+            else
+                echo "  ✗ Docker commands failing"
+                echo "  ⚠ Try: wsl --shutdown && restart Docker Desktop"
+            fi
         else
             echo "  ✗ Docker Desktop not found on Windows"
-        fi
-        
-        if [[ -S /var/run/docker.sock ]]; then
-            echo "  ✓ Docker socket accessible in WSL"
-        else
-            echo "  ✗ Docker socket not accessible in WSL"
         fi
         
         # Check Windows path accessibility
@@ -1205,8 +1365,15 @@ troubleshoot() {
     
     echo "=== Docker Status ==="
     if command_exists docker; then
-        docker version 2>/dev/null || echo "Docker not accessible"
-        docker info 2>/dev/null | head -20 || echo "Docker daemon not running"
+        if is_wsl && [[ -n "${WINDOWS_DOCKER_PATH:-}" ]]; then
+            echo "Docker Type: Windows Docker.exe via WSL"
+            echo "Docker Path: $WINDOWS_DOCKER_PATH"
+            docker_version_wrapper 2>/dev/null || echo "Docker not accessible"
+        else
+            echo "Docker Type: $(if is_docker_desktop; then echo "Docker Desktop"; else echo "Native Docker"; fi)"
+            docker_version_wrapper 2>/dev/null || echo "Docker not accessible"
+        fi
+        docker_info_wrapper 2>/dev/null | head -20 || echo "Docker daemon not running"
     else
         echo "Docker not installed"
     fi
@@ -1280,6 +1447,8 @@ troubleshoot() {
     echo "4. For detailed cluster logs, run: minikube logs -p $PROFILE_NAME"
     echo "5. To completely reset, run: $0 delete && $0 fresh-install"
     echo "6. For Docker issues in WSL, ensure Docker Desktop WSL integration is enabled"
+    echo "7. If WSL integration error, try: wsl --shutdown && restart Docker Desktop"
+    echo "8. Reset Docker Desktop WSL integration in Settings > Resources > WSL Integration"
 }
 
 # Clean up function for failed installations
@@ -1315,6 +1484,7 @@ COMMANDS:
     install-docker     Install Docker only (or configure Docker Desktop)
     configure-registry Configure container registry mirrors and Kubernetes image repository
     configure-mirror   Configure enterprise mirror for binaries
+    configure-docker-url Configure Docker Desktop connection via URL/TCP
     fix-docker         Fix Docker service issues
     troubleshoot       Run diagnostics and show troubleshooting information
     help               Show this help message
@@ -1332,6 +1502,7 @@ EXAMPLES:
     $0 fresh-install                           # Fresh installation with Docker, Minikube, kubectl
     $0 fresh-install --memory 8192 --cpus 4   # Fresh install with more resources
     $0 install-docker                          # Install Docker only (or configure Docker Desktop)
+    $0 setup-windows-docker                   # Setup Windows Docker.exe wrapper (WSL only)
     $0 start --driver virtualbox              # Start with VirtualBox driver (not recommended in WSL)
     $0 start --driver docker                  # Start with Docker driver (recommended for WSL/Docker Desktop)
     $0 status                                  # Show cluster status
@@ -1341,12 +1512,14 @@ EXAMPLES:
 
 WSL/DOCKER DESKTOP NOTES:
     - In WSL with Docker Desktop, ensure WSL 2 integration is enabled
+    - Alternatively, use Windows Docker.exe directly: $0 setup-windows-docker
     - Go to Docker Desktop > Settings > Resources > WSL Integration
     - Enable integration with your WSL distribution
     - Docker daemon configuration is managed through Docker Desktop settings
     - For insecure registries, configure them in Docker Desktop > Settings > Docker Engine
 
 EOF
+}
 }
 
 # Parse command line arguments
@@ -1467,6 +1640,17 @@ main() {
             ;;
         configure-mirror)
             configure_mirror
+            ;;
+        configure-docker-url)
+            configure_docker_desktop_url
+            ;;
+        setup-windows-docker)
+            if is_wsl; then
+                setup_windows_docker
+            else
+                log_error "This command only works in WSL environment"
+                exit 1
+            fi
             ;;
         fix-docker)
             fix_docker_service
