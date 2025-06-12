@@ -19,21 +19,22 @@ MINIKUBE_MEMORY="4096"
 MINIKUBE_CPUS="2"
 
 # Image configurations
-KUBE_VERSION="v1.31.1"
-PAUSE_VERSION="3.9"
-ETCD_VERSION="3.5.15-0"
-COREDNS_VERSION="v1.11.1"
-STORAGE_PROVISIONER_VERSION="v5"
+KUBE_VERSION="v1.33.1"
+PAUSE_VERSION="3.10"
+ETCD_VERSION="3.5.21-0"
+COREDNS_VERSION="v1.12.0"
+STORAGE_PROVISIONER_VERSION="v5_6e38f40d628d"
 
 # Custom image URLs (set these to your custom registries if needed)
-CUSTOM_PAUSE_IMAGE=""
-CUSTOM_APISERVER_IMAGE=""
-CUSTOM_CONTROLLER_IMAGE=""
-CUSTOM_SCHEDULER_IMAGE=""
-CUSTOM_PROXY_IMAGE=""
-CUSTOM_ETCD_IMAGE=""
-CUSTOM_COREDNS_IMAGE=""
-CUSTOM_STORAGE_IMAGE=""
+CUSTOM_PAUSE_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/registry.k8s.io/pause:3.10"
+CUSTOM_APISERVER_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/registry.k8s.io/kube-apiserver:v1.33.1"
+CUSTOM_CONTROLLER_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/registry.k8s.io/kube-controller-manager:v1.33.1"
+CUSTOM_SCHEDULER_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/registry.k8s.io/kube-scheduler:v1.33.1"
+CUSTOM_PROXY_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/registry.k8s.io/kube-proxy:v1.33.1"
+CUSTOM_ETCD_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/registry.k8s.io/etcd:3.5.21-0"
+CUSTOM_COREDNS_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/registry.k8s.io/coredns/coredns:v1.12.0"
+CUSTOM_STORAGE_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/gcr.io/k8s-minikube/storage-provisioner:v5_6e38f40d628d"
+CUSTOM_KICBASE_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/gcr.io/k8s-minikube/kicbase:v0.0.47"
 
 log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
@@ -54,6 +55,7 @@ pull_and_tag_images() {
         ["etcd"]="${CUSTOM_ETCD_IMAGE:-registry.k8s.io/etcd:$ETCD_VERSION}:registry.k8s.io/etcd:$ETCD_VERSION"
         ["coredns"]="${CUSTOM_COREDNS_IMAGE:-registry.k8s.io/coredns/coredns:$COREDNS_VERSION}:registry.k8s.io/coredns/coredns:$COREDNS_VERSION"
         ["storage"]="${CUSTOM_STORAGE_IMAGE:-gcr.io/k8s-minikube/storage-provisioner:$STORAGE_PROVISIONER_VERSION}:gcr.io/k8s-minikube/storage-provisioner:$STORAGE_PROVISIONER_VERSION"
+        ["kicbase"]="${CUSTOM_KICBASE_IMAGE:-gcr.io/k8s-minikube/kicbase:latest}:gcr.io/k8s-minikube/kicbase:latest"
     )
     
     for component in "${!images[@]}"; do
@@ -99,13 +101,24 @@ start_cluster() {
     
     # Start with minimal flags
     log_info "Starting minikube cluster..."
-    log_info "Command: minikube start --driver=$MINIKUBE_DRIVER --memory=$MINIKUBE_MEMORY --cpus=$MINIKUBE_CPUS --profile=$PROFILE_NAME"
     
-    if minikube start \
-        --driver="$MINIKUBE_DRIVER" \
-        --memory="$MINIKUBE_MEMORY" \
-        --cpus="$MINIKUBE_CPUS" \
-        --profile="$PROFILE_NAME"; then
+    # Build command args
+    local start_args=(
+        "--driver=$MINIKUBE_DRIVER"
+        "--memory=$MINIKUBE_MEMORY"
+        "--cpus=$MINIKUBE_CPUS"
+        "--profile=$PROFILE_NAME"
+    )
+    
+    # Add custom kicbase if specified
+    if [[ -n "$CUSTOM_KICBASE_IMAGE" ]]; then
+        start_args+=("--base-image=$CUSTOM_KICBASE_IMAGE")
+        log_info "Using custom kicbase: $CUSTOM_KICBASE_IMAGE"
+    fi
+    
+    log_info "Command: minikube start ${start_args[*]}"
+    
+    if minikube start "${start_args[@]}"; then
         log_success "Cluster started successfully!"
     else
         log_error "Failed to start cluster"
@@ -134,6 +147,11 @@ load_images_into_minikube() {
         "registry.k8s.io/coredns/coredns:$COREDNS_VERSION"
         "gcr.io/k8s-minikube/storage-provisioner:$STORAGE_PROVISIONER_VERSION"
     )
+    
+    # Add kicbase if we have a custom one
+    if [[ -n "$CUSTOM_KICBASE_IMAGE" ]]; then
+        images_to_load+=("gcr.io/k8s-minikube/kicbase:latest")
+    fi
     
     for image in "${images_to_load[@]}"; do
         log_info "Loading $image into minikube..."
