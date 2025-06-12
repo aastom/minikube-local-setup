@@ -344,13 +344,16 @@ pre_pull_images() {
     # Also pre-pull kicbase if specified
     if [[ -n "$KICBASE_IMAGE" ]]; then
         log_info "Pre-pulling kicbase: $KICBASE_IMAGE"
-        if ! docker pull "$KICBASE_IMAGE" 2>/dev/null; then
+        if docker pull "$KICBASE_IMAGE" 2>/dev/null; then
+            log_success "Successfully pre-pulled kicbase: $KICBASE_IMAGE"
+        else
             log_warning "Failed to pull kicbase image: $KICBASE_IMAGE"
             log_info "Minikube will attempt to download it during cluster start"
-        else
-            log_success "Successfully pre-pulled kicbase: $KICBASE_IMAGE"
         fi
     fi
+    
+    local pull_failures=0
+    local pull_successes=0
     
     for image_spec in "${images[@]}"; do
         local component="${image_spec%%:*}"
@@ -358,33 +361,47 @@ pre_pull_images() {
         
         log_info "Pulling $component: $image_url"
         
-        if ! docker pull "$image_url" 2>/dev/null; then
+        if docker pull "$image_url" 2>/dev/null; then
+            log_success "Successfully pulled $image_url"
+            ((pull_successes++))
+        else
             log_warning "Failed to pull $image_url, trying fallback registries"
             
             # Try alternative registries for standard images
             local component_name="${component}"
             local version="${image_url##*:}"
-            local fallback_attempted=false
+            local fallback_success=false
             
             for alt_reg in "k8s.gcr.io" "gcr.io/k8s-minikube" "$DEFAULT_REGISTRY"; do
                 local alt_image="${alt_reg}/${component_name}:${version}"
                 log_info "Trying fallback: $alt_image"
                 if docker pull "$alt_image" 2>/dev/null; then
-                    docker tag "$alt_image" "$image_url" 2>/dev/null || true
-                    log_success "Tagged fallback $alt_image as $image_url"
-                    fallback_attempted=true
-                    break
+                    if docker tag "$alt_image" "$image_url" 2>/dev/null; then
+                        log_success "Tagged fallback $alt_image as $image_url"
+                        fallback_success=true
+                        ((pull_successes++))
+                        break
+                    else
+                        log_warning "Failed to tag $alt_image as $image_url"
+                    fi
                 fi
             done
             
-            if [[ "$fallback_attempted" != true ]]; then
-                log_warning "All fallback attempts failed for $component"
-                log_info "Minikube will attempt to download it during cluster start"
+            if [[ "$fallback_success" != true ]]; then
+                log_warning "All attempts failed for $component"
+                ((pull_failures++))
             fi
-        else
-            log_success "Successfully pulled $image_url"
         fi
     done
+    
+    log_info "Image pre-pull summary: $pull_successes successful, $pull_failures failed"
+    if [[ $pull_failures -gt 0 ]]; then
+        log_warning "Some images failed to pre-pull, but continuing with cluster start"
+        log_info "Minikube will attempt to download missing images during startup"
+    fi
+    
+    # Always return success to continue with cluster start
+    return 0
 }
 
 # Start minikube cluster
@@ -404,11 +421,16 @@ start_minikube() {
     # Check if Docker is accessible and try to pre-pull images
     if docker info >/dev/null 2>&1; then
         log_info "Docker is accessible, attempting to pre-pull images..."
-        pre_pull_images
+        # Call pre_pull_images but don't let it stop the script
+        if ! pre_pull_images; then
+            log_warning "Image pre-pulling encountered issues, but continuing with cluster start"
+        fi
     else
         log_warning "Docker not accessible, skipping image pre-pull"
         log_info "Images will be downloaded during cluster start"
     fi
+    
+    log_info "Proceeding with cluster start..."
     
     # Build minikube start command with shorter, validated parameters
     local start_cmd="minikube start"
@@ -488,21 +510,27 @@ start_minikube() {
     local retry_count=0
     local max_retries=3
     
+    log_info "=== STARTING MINIKUBE CLUSTER ==="
+    log_info "Command: $start_cmd"
+    
     while [[ $retry_count -lt $max_retries ]]; do
-        log_info "Starting cluster (attempt $((retry_count + 1))/$max_retries)..."
+        log_info "Cluster start attempt $((retry_count + 1))/$max_retries"
         
         if eval "$start_cmd"; then
             log_success "Cluster started successfully!"
             break
         else
+            local exit_code=$?
             ((retry_count++))
             if [[ $retry_count -lt $max_retries ]]; then
-                log_warning "Start failed, cleaning up and retrying..."
+                log_warning "Start failed with exit code $exit_code, cleaning up and retrying..."
                 minikube delete -p "$PROFILE_NAME" 2>/dev/null || true
                 sleep 10
             else
                 log_error "Failed to start cluster after $max_retries attempts"
-                exit 1
+                log_error "Last exit code: $exit_code"
+                log_info "You can check logs with: minikube logs -p $PROFILE_NAME"
+                return 1
             fi
         fi
     done
