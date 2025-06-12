@@ -48,7 +48,7 @@ mkdir -p "$CONFIG_DIR"
 # Handle interruption signals for clean shutdown
 cleanup_on_exit() {
     local exit_code=$?
-    if [[ $exit_code -ne 0 ]]; then
+    if [[ $exit_code -ne 0 && $exit_code -ne 130 && $exit_code -ne 143 ]]; then
         log_warning "Script interrupted or failed (exit code: $exit_code)"
         log_info "Check logs at: $LOG_FILE"
         
@@ -62,8 +62,7 @@ cleanup_on_exit() {
 
 # Set up signal handlers
 trap cleanup_on_exit EXIT
-trap 'log_warning "Received SIGINT, shutting down..."; exit 130' INT
-trap 'log_warning "Received SIGTERM, shutting down..."; exit 143' TERM
+trap 'echo; log_warning "Received interrupt signal, shutting down gracefully..."; exit 0' INT TERM
 
 # Logging functions
 log() {
@@ -552,16 +551,30 @@ start_minikube() {
     
     # Check if already running
     if command_exists minikube && minikube status -p "$PROFILE_NAME" 2>/dev/null | grep -q "Running"; then
-        log_warning "Cluster is already running"
+        log_success "Cluster is already running!"
         show_cluster_info
         return 0
+    fi
+    
+    # Quick connectivity check
+    log_info "Checking connectivity..."
+    if ! wget --spider --timeout=10 "https://github.com" 2>/dev/null; then
+        log_warning "Internet connectivity issues detected"
+        log_info "Some operations may fail or take longer"
     fi
     
     # Check if Docker is accessible and try to pre-pull images
     if docker info >/dev/null 2>&1; then
         log_info "Docker is accessible, processing images..."
         configure_minikube_local_images
-        pre_pull_and_tag_images
+        
+        # Only do image pre-pull if we have custom images or this is a fresh install
+        if [[ -n "$KICBASE_IMAGE$PAUSE_IMAGE$KUBE_APISERVER_IMAGE$KUBE_CONTROLLER_MANAGER_IMAGE$KUBE_SCHEDULER_IMAGE$KUBE_PROXY_IMAGE$ETCD_IMAGE$COREDNS_IMAGE$STORAGE_PROVISIONER_IMAGE" ]] || [[ ! -f "$CONFIG_DIR/image-manifest.txt" ]]; then
+            pre_pull_and_tag_images
+        else
+            log_info "Using existing image cache, skipping pre-pull"
+            log_info "Use 'clean-images' command to force re-download"
+        fi
     else
         log_warning "Docker not accessible, skipping image pre-pull"
         log_info "Images will be downloaded during cluster start"
@@ -961,29 +974,103 @@ fresh_install() {
         exit 1
     fi
     
+    # Create lock file to prevent multiple instances
+    local lock_file="$CONFIG_DIR/.fresh_install.lock"
+    if [[ -f "$lock_file" ]]; then
+        local lock_pid=$(cat "$lock_file" 2>/dev/null)
+        if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+            log_error "Another fresh-install process is already running (PID: $lock_pid)"
+            log_info "If this is incorrect, remove: $lock_file"
+            exit 1
+        else
+            log_info "Removing stale lock file"
+            rm -f "$lock_file"
+        fi
+    fi
+    
+    # Create lock file with current PID
+    echo $ > "$lock_file"
+    
+    # Ensure lock file is removed on exit
+    trap 'rm -f "$lock_file"; cleanup_on_exit' EXIT
+    
+    echo "========================================"
+    log_info "PHASE 1: Setting up Docker"
+    echo "========================================"
+    
     # Setup Windows Docker
-    setup_windows_docker
+    if ! setup_windows_docker; then
+        log_error "Failed to setup Windows Docker"
+        exit 1
+    fi
+    
+    echo "========================================"
+    log_info "PHASE 2: Installing dependencies"
+    echo "========================================"
     
     # Install dependencies
-    install_dependencies
+    if ! install_dependencies; then
+        log_error "Failed to install dependencies"
+        exit 1
+    fi
+    
+    echo "========================================"
+    log_info "PHASE 3: Installing Kubernetes tools"
+    echo "========================================"
     
     # Install tools
-    install_minikube
-    install_kubectl
+    if ! install_minikube; then
+        log_error "Failed to install minikube"
+        exit 1
+    fi
+    
+    if ! install_kubectl; then
+        log_error "Failed to install kubectl"
+        exit 1
+    fi
+    
+    echo "========================================"
+    log_info "PHASE 4: Loading configuration"
+    echo "========================================"
     
     # Load image configuration
     load_image_config
     
+    echo "========================================"
+    log_info "PHASE 5: Cleaning up existing cluster"
+    echo "========================================"
+    
     # Clean up any existing cluster
     if command_exists minikube && minikube status -p "$PROFILE_NAME" >/dev/null 2>&1; then
         log_warning "Removing existing cluster..."
-        minikube delete -p "$PROFILE_NAME"
+        if ! minikube delete -p "$PROFILE_NAME"; then
+            log_warning "Failed to delete existing cluster cleanly, forcing cleanup..."
+            # Force cleanup
+            docker ps -a --filter "name=$PROFILE_NAME" --format "{{.ID}}" | xargs -r docker rm -f 2>/dev/null || true
+            docker network rm "$PROFILE_NAME" 2>/dev/null || true
+        fi
+        sleep 5
     fi
     
-    # Start new cluster
-    start_minikube
+    echo "========================================"
+    log_info "PHASE 6: Starting new cluster"
+    echo "========================================"
     
-    log_success "Fresh installation completed!"
+    # Start new cluster
+    if ! start_minikube; then
+        log_error "Failed to start minikube cluster"
+        exit 1
+    fi
+    
+    # Remove lock file on successful completion
+    rm -f "$lock_file"
+    
+    echo "========================================"
+    log_success "Fresh installation completed successfully!"
+    echo "========================================"
+    
+    # Show final status
+    show_cluster_info
 }
 
 # Show help
@@ -1137,15 +1224,50 @@ parse_args() {
 
 # Main function
 main() {
+    # Check if another instance is running
+    local main_lock_file="$CONFIG_DIR/.script.lock"
+    if [[ -f "$main_lock_file" ]]; then
+        local lock_pid=$(cat "$main_lock_file" 2>/dev/null)
+        if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+            log_error "Another instance of this script is already running (PID: $lock_pid)"
+            log_info "If this is incorrect, remove: $main_lock_file"
+            exit 1
+        else
+            rm -f "$main_lock_file"
+        fi
+    fi
+    
     if [[ $# -eq 0 ]]; then
         show_help
-        exit 1
+        exit 0
     fi
     
     local command=$1
     shift
+    
+    # Validate command before processing
+    case $command in
+        fresh-install|setup-docker|configure-images|start|stop|delete|status|troubleshoot|clean-images|help|--help|-h)
+            # Valid command, continue
+            ;;
+        *)
+            log_error "Unknown command: $command"
+            echo
+            show_help
+            exit 1
+            ;;
+    esac
+    
+    # Create main lock file for most operations (except help and status)
+    if [[ "$command" != "help" && "$command" != "--help" && "$command" != "-h" && "$command" != "status" && "$command" != "troubleshoot" ]]; then
+        echo $ > "$main_lock_file"
+        trap 'rm -f "$main_lock_file"; cleanup_on_exit' EXIT
+    fi
+    
+    # Parse arguments after command validation
     parse_args "$@"
     
+    # Execute command with error handling
     case $command in
         fresh-install)
             fresh_install
@@ -1177,12 +1299,10 @@ main() {
         help|--help|-h)
             show_help
             ;;
-        *)
-            log_error "Unknown command: $command"
-            show_help
-            exit 1
-            ;;
     esac
+    
+    # Remove lock file on successful completion
+    rm -f "$main_lock_file" 2>/dev/null || true
 }
 
 # Run main function with all arguments
