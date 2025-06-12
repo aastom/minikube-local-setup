@@ -55,7 +55,7 @@ pull_and_tag_images() {
         ["etcd"]="${CUSTOM_ETCD_IMAGE:-registry.k8s.io/etcd:$ETCD_VERSION}:registry.k8s.io/etcd:$ETCD_VERSION"
         ["coredns"]="${CUSTOM_COREDNS_IMAGE:-registry.k8s.io/coredns/coredns:$COREDNS_VERSION}:registry.k8s.io/coredns/coredns:$COREDNS_VERSION"
         ["storage"]="${CUSTOM_STORAGE_IMAGE:-gcr.io/k8s-minikube/storage-provisioner:$STORAGE_PROVISIONER_VERSION}:gcr.io/k8s-minikube/storage-provisioner:$STORAGE_PROVISIONER_VERSION"
-        ["kicbase"]="${CUSTOM_KICBASE_IMAGE:-gcr.io/k8s-minikube/kicbase:latest}:gcr.io/k8s-minikube/kicbase:latest"
+        ["kicbase"]="${CUSTOM_KICBASE_IMAGE:-gcr.io/k8s-minikube/kicbase:v0.0.47}:gcr.io/k8s-minikube/kicbase:v0.0.47"
     )
     
     for component in "${!images[@]}"; do
@@ -150,7 +150,7 @@ load_images_into_minikube() {
     
     # Add kicbase if we have a custom one
     if [[ -n "$CUSTOM_KICBASE_IMAGE" ]]; then
-        images_to_load+=("gcr.io/k8s-minikube/kicbase:latest")
+        images_to_load+=("gcr.io/k8s-minikube/kicbase:v0.0.47")
     fi
     
     for image in "${images_to_load[@]}"; do
