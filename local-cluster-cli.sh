@@ -20,7 +20,6 @@ MINIKUBE_DRIVER="docker"
 KUBECTL_VERSION="v1.31.1"
 PROFILE_NAME="enterprise-k8s"
 INSECURE_REGISTRIES="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,europe-docker.pkg.dev"
-IMAGE_REPOSITORY="europe-docker.pkg.dev/mgmt-bak-bld-1d47/staging/ap/edh/a107595/images/platform-tools/registry.k8s.io"
 CONFIG_DIR="$HOME/.local-cluster-cli"
 LOG_FILE="$CONFIG_DIR/cluster.log"
 
@@ -35,12 +34,13 @@ ETCD_IMAGE=""
 COREDNS_IMAGE=""
 STORAGE_PROVISIONER_IMAGE=""
 
-# Default image versions
+# Default image versions and sources
 PAUSE_VERSION="3.9"
 KUBE_VERSION="v1.31.1"
 ETCD_VERSION="3.5.15-0"
 COREDNS_VERSION="v1.11.1"
 STORAGE_PROVISIONER_VERSION="v5"
+DEFAULT_REGISTRY="registry.k8s.io"
 
 # Create config directory
 mkdir -p "$CONFIG_DIR"
@@ -88,7 +88,7 @@ load_image_config() {
 # Configure individual image URLs
 configure_images() {
     log_info "Configuring individual image URLs..."
-    echo "Leave empty to use default. Current base repository: $IMAGE_REPOSITORY"
+    echo "Enter full image URLs (including registry). Leave empty to use defaults from $DEFAULT_REGISTRY"
     echo
     
     read -p "kicbase image URL (for minikube VM): " KICBASE_IMAGE
@@ -145,12 +145,8 @@ get_image_url() {
         return 0
     fi
     
-    # Otherwise construct from base repository
-    if [[ -n "$IMAGE_REPOSITORY" ]]; then
-        echo "${IMAGE_REPOSITORY}/${default_name}:${version}"
-    else
-        echo "registry.k8s.io/${default_name}:${version}"
-    fi
+    # Otherwise use default registry
+    echo "${DEFAULT_REGISTRY}/${default_name}:${version}"
 }
 
 # Find Windows Docker executable
@@ -356,7 +352,7 @@ pre_pull_images() {
             
             # Try alternative registries for standard images
             local base_image="${component}:${image_url##*:}"
-            for alt_reg in "k8s.gcr.io" "gcr.io/k8s-minikube" "registry.k8s.io"; do
+            for alt_reg in "k8s.gcr.io" "gcr.io/k8s-minikube" "$DEFAULT_REGISTRY"; do
                 local alt_image="${alt_reg}/${base_image}"
                 log_info "Trying: $alt_image"
                 if docker pull "$alt_image" 2>/dev/null; then
@@ -406,12 +402,6 @@ start_minikube() {
     if [[ -n "$KICBASE_IMAGE" ]]; then
         start_cmd+=" --base-image=\"$KICBASE_IMAGE\""
         log_info "Using custom kicbase image: $KICBASE_IMAGE"
-    fi
-    
-    # Add image repository (will be overridden by individual images if specified)
-    if [[ -n "$IMAGE_REPOSITORY" ]]; then
-        start_cmd+=" --image-repository=\"$IMAGE_REPOSITORY\""
-        log_info "Using base image repository: $IMAGE_REPOSITORY"
     fi
     
     # Add individual image overrides
@@ -713,8 +703,8 @@ EXAMPLES:
     $0 fresh-install                                     # Complete setup with defaults
     $0 configure-images                                  # Interactive image configuration
     $0 start --memory 8192 --cpus 4                     # Start with more resources
-    $0 start --pause my-registry.com/pause:3.9          # Start with custom pause image
-    $0 start --apiserver my-registry.com/kube-apiserver:v1.31.1 # Custom apiserver
+    $0 start --pause "my-registry.com/pause:3.9" --apiserver "my-registry.com/kube-apiserver:v1.31.1"
+    $0 configure-images                                  # Interactive image configuration
     
 CONFIGURATION FILES:
     ~/.local-cluster-cli/images.conf    # Custom image URLs
@@ -732,6 +722,10 @@ INDIVIDUAL IMAGE OVERRIDE EXAMPLES:
         --etcd "my-registry.com/etcd:3.5.15-0" \\
         --coredns "my-registry.com/coredns:v1.11.1" \\
         --storage "my-registry.com/storage-provisioner:v5"
+
+DEFAULT IMAGES (when no custom URLs specified):
+    kicbase: gcr.io/k8s-minikube/kicbase:latest
+    All others: registry.k8s.io/[component]:[version]
 
 EOF
 }
