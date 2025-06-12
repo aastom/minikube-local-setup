@@ -136,23 +136,90 @@ configure_registry_mirrors() {
     IMAGE_REPOSITORY="${custom_image_repository:-$IMAGE_REPOSITORY}"
 }
 
-# Configure Docker daemon for insecure registries
-configure_docker_daemon() {
-    log_info "Configuring Docker daemon for enterprise registries..."
+# Check if running in WSL environment
+is_wsl() {
+    [[ -n "${WSL_DISTRO_NAME:-}" ]] || [[ -n "${WSL_INTEROP:-}" ]] || [[ -f /proc/sys/fs/binfmt_misc/WSLInterop ]] || grep -qi microsoft /proc/version 2>/dev/null
+}
+
+# Check if Docker Desktop is available
+is_docker_desktop() {
+    # Check if we're in WSL and Docker Desktop socket is available
+    if is_wsl; then
+        # Docker Desktop in WSL2 typically uses /var/run/docker.sock or Docker Desktop's socket
+        [[ -S /var/run/docker.sock ]] || [[ -S /mnt/wsl/shared-docker/docker.sock ]] || [[ -S "$HOME/.docker/desktop/docker.sock" ]]
+    else
+        # On Windows with Docker Desktop, check for typical indicators
+        [[ -n "${DOCKER_HOST:-}" ]] && [[ "${DOCKER_HOST}" == *"docker-desktop"* ]]
+    fi
+}
+
+# Configure Docker Desktop integration
+configure_docker_desktop() {
+    log_info "Configuring Docker Desktop integration for WSL..."
     
-    local docker_daemon_config="/etc/docker/daemon.json"
-    local temp_config="/tmp/daemon.json"
-    
-    # Create backup if file exists
-    if [[ -f "$docker_daemon_config" ]]; then
-        sudo cp "$docker_daemon_config" "${docker_daemon_config}.backup.$(date +%s)"
-        log_info "Backed up existing Docker daemon configuration"
+    if ! is_wsl; then
+        log_warning "Not running in WSL environment"
+        return 1
     fi
     
-    # Create new daemon configuration
+    # Check if Docker Desktop is running
+    if ! docker info >/dev/null 2>&1; then
+        log_error "Docker Desktop is not running or not accessible from WSL"
+        log_info "Please ensure:"
+        log_info "1. Docker Desktop is running on Windows"
+        log_info "2. WSL 2 integration is enabled in Docker Desktop settings"
+        log_info "3. Your WSL distro is enabled in Docker Desktop > Settings > Resources > WSL Integration"
+        return 1
+    fi
+    
+    log_success "Docker Desktop is accessible from WSL"
+    
+    # For Docker Desktop, we don't modify daemon.json directly
+    # Instead, we configure it through Docker Desktop settings or use docker context
+    
+    # Check current Docker context
+    local current_context=$(docker context show 2>/dev/null || echo "default")
+    log_info "Current Docker context: $current_context"
+    
+    # Create a custom context for enterprise settings if needed
+    if [[ "$current_context" != "enterprise" ]]; then
+        log_info "Creating enterprise Docker context..."
+        
+        # Get current Docker endpoint
+        local docker_host=$(docker context inspect "$current_context" --format '{{.Endpoints.docker.Host}}' 2>/dev/null || echo "unix:///var/run/docker.sock")
+        
+        # Create enterprise context with custom settings
+        if docker context create enterprise --docker "host=$docker_host" 2>/dev/null; then
+            log_success "Created enterprise Docker context"
+        else
+            log_info "Enterprise context already exists or using default"
+        fi
+    fi
+    
+    # Configure Docker Desktop settings through registry modifications (if needed)
+    configure_docker_desktop_registry_settings
+    
+    return 0
+}
+
+# Configure registry settings for Docker Desktop
+configure_docker_desktop_registry_settings() {
+    log_info "Configuring registry settings for Docker Desktop..."
+    
+    # Create Docker CLI config directory if it doesn't exist
+    local docker_config_dir="$HOME/.docker"
+    mkdir -p "$docker_config_dir"
+    
+    # Create or update Docker CLI config for insecure registries
+    local cli_config="$docker_config_dir/config.json"
+    local temp_config="/tmp/docker_cli_config.json"
+    
+    # Build the configuration
     cat > "$temp_config" << EOF
 {
-  "insecure-registries": [
+  "auths": {},
+  "experimental": "disabled",
+  "insecureRegistries": [
     "10.0.0.0/8",
     "172.16.0.0/12",
     "192.168.0.0/16",
@@ -160,58 +227,309 @@ configure_docker_daemon() {
     "*.pkg.dev",
     "gcr.io",
     "k8s.gcr.io",
-    "registry.k8s.io"
-  ],
-  "registry-mirrors": [
+    "registry.k8s.io",
+    "localhost",
+    "127.0.0.1"
+  ]
+}
 EOF
 
+    # Merge with existing config if it exists
+    if [[ -f "$cli_config" ]]; then
+        log_info "Backing up existing Docker CLI config"
+        cp "$cli_config" "${cli_config}.backup.$(date +%s)"
+        
+        # Try to merge configurations (simplified approach)
+        if command_exists jq; then
+            jq -s '.[0] * .[1]' "$cli_config" "$temp_config" > "${temp_config}.merged" 2>/dev/null && mv "${temp_config}.merged" "$temp_config"
+        fi
+    fi
+    
+    mv "$temp_config" "$cli_config"
+    log_success "Docker CLI configuration updated"
+    
+    # Note about Docker Desktop settings
+    log_warning "Note: For full insecure registry support in Docker Desktop:"
+    log_info "1. Open Docker Desktop"
+    log_info "2. Go to Settings > Docker Engine"
+    log_info "3. Add insecure registries to the JSON configuration:"
+    log_info '   "insecure-registries": ["europe-docker.pkg.dev", "*.pkg.dev", "10.0.0.0/8"]'
+    log_info "4. Click 'Apply & Restart'"
+}
+
+# Install Docker on Ubuntu/Debian with Docker Desktop awareness
+install_docker() {
+    log_info "Installing Docker..."
+    
+    # Check if we're in WSL with Docker Desktop
+    if is_wsl; then
+        log_info "WSL environment detected"
+        
+        # Check if Docker Desktop is already accessible
+        if docker info >/dev/null 2>&1; then
+            log_success "Docker Desktop is already accessible from WSL"
+            configure_docker_desktop
+            return 0
+        fi
+        
+        # Check if Docker Desktop might be installed but not configured
+        if [[ -f "/mnt/c/Program Files/Docker/Docker/Docker Desktop.exe" ]] || [[ -f "/mnt/c/ProgramData/Docker/config/daemon.json" ]]; then
+            log_warning "Docker Desktop appears to be installed on Windows but not accessible from WSL"
+            log_info "Please enable WSL 2 integration in Docker Desktop:"
+            log_info "1. Open Docker Desktop on Windows"
+            log_info "2. Go to Settings > Resources > WSL Integration"
+            log_info "3. Enable integration with your WSL distro"
+            log_info "4. Apply & Restart Docker Desktop"
+            log_info "Then run this script again"
+            return 1
+        fi
+        
+        log_info "Docker Desktop not found. You can either:"
+        log_info "1. Install Docker Desktop on Windows (recommended for WSL)"
+        log_info "2. Install Docker CE in WSL (continuing with native installation)"
+        
+        read -p "Continue with native Docker installation in WSL? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log_info "Please install Docker Desktop on Windows and enable WSL integration"
+            exit 1
+        fi
+    fi
+    
+    # Check if Docker is already installed (native installation)
+    if command_exists docker; then
+        log_info "Docker is already installed"
+        # Check if docker daemon is running
+        if docker info >/dev/null 2>&1; then
+            log_success "Docker is installed and running"
+            if is_wsl; then
+                configure_docker_desktop
+            fi
+            return 0
+        else
+            log_info "Docker is installed but not running. Starting Docker service..."
+            sudo systemctl start docker
+            sudo systemctl enable docker
+            return 0
+        fi
+    fi
+    
+    # Continue with native Docker installation...
+    log_info "Installing Docker natively in WSL/Linux..."
+    
+    # Update package index with corporate network settings
+    log_info "Updating package index..."
+    sudo apt-get $APT_FLAGS update
+    
+    # Remove any old Docker packages
+    log_info "Removing old Docker packages..."
+    sudo apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
+    
+    # Install required packages
+    log_info "Installing required packages..."
+    sudo apt-get $APT_FLAGS install -y \
+        apt-transport-https \
+        ca-certificates \
+        curl \
+        gnupg \
+        lsb-release \
+        software-properties-common
+    
+    # Install Docker directly from apt repositories (more reliable in enterprise environments)
+    log_info "Installing Docker from apt repositories..."
+    sudo apt-get $APT_FLAGS install -y docker.io docker-compose
+    
+    # Start and enable Docker service
+    log_info "Starting Docker service..."
+    sudo systemctl start docker
+    sudo systemctl enable docker
+    
+    # Add current user to docker group
+    log_info "Adding current user to docker group..."
+    sudo usermod -aG docker "$USER"
+    
+    # Test Docker installation
+    log_info "Testing Docker installation..."
+    if sudo docker run --rm hello-world >/dev/null 2>&1; then
+        log_success "Docker installed and configured successfully!"
+    else
+        log_warning "Docker installed but connectivity test failed (likely due to corporate firewall)"
+        log_success "Docker installation completed"
+    fi
+    
+    log_warning "Please logout and login again (or run 'newgrp docker') to use Docker without sudo"
+}
+
+# Configure Docker daemon for insecure registries with Docker Desktop awareness
+configure_docker_daemon() {
+    # If Docker Desktop is detected, use different configuration approach
+    if is_docker_desktop; then
+        log_info "Docker Desktop detected, using Desktop-specific configuration..."
+        return configure_docker_desktop
+    fi
+    
+    log_info "Configuring Docker daemon for enterprise registries..."
+    
+    local docker_daemon_config="/etc/docker/daemon.json"
+    local temp_config="/tmp/daemon.json"
+    local existing_config=""
+    
+    # Create backup if file exists and read existing config
+    if [[ -f "$docker_daemon_config" ]]; then
+        sudo cp "$docker_daemon_config" "${docker_daemon_config}.backup.$(date +%s)"
+        log_info "Backed up existing Docker daemon configuration"
+        existing_config=$(sudo cat "$docker_daemon_config" 2>/dev/null || echo "{}")
+    else
+        existing_config="{}"
+    fi
+    
+    # Create Docker config directory if it doesn't exist
+    sudo mkdir -p /etc/docker
+    
+    # Build insecure registries array
+    local insecure_registries=(
+        "10.0.0.0/8"
+        "172.16.0.0/12" 
+        "192.168.0.0/16"
+        "europe-docker.pkg.dev"
+        "*.pkg.dev"
+        "gcr.io"
+        "k8s.gcr.io"
+        "registry.k8s.io"
+        "localhost"
+        "127.0.0.1"
+    )
+    
+    # Create new daemon configuration with better error handling
+    cat > "$temp_config" << EOF
+{
+  "insecure-registries": [
+EOF
+    
+    # Add insecure registries
+    local first=true
+    for registry in "${insecure_registries[@]}"; do
+        if [[ "$first" == true ]]; then
+            echo "    \"$registry\"" >> "$temp_config"
+            first=false
+        else
+            echo "    ,\"$registry\"" >> "$temp_config"
+        fi
+    done
+    
+    echo "  ]," >> "$temp_config"
+    
     # Add registry mirrors if configured
+    echo "  \"registry-mirrors\": [" >> "$temp_config"
     if [[ -n "$REGISTRY_MIRRORS" ]]; then
         IFS=',' read -ra MIRRORS <<< "$REGISTRY_MIRRORS"
-        local first=true
-        for mirror in "${mirrors[@]}"; do
-            if [[ "$first" == true ]]; then
+        local mirror_first=true
+        for mirror in "${MIRRORS[@]}"; do
+            [[ -z "$mirror" ]] && continue
+            if [[ "$mirror_first" == true ]]; then
                 echo "    \"$mirror\"" >> "$temp_config"
-                first=false
+                mirror_first=false
             else
                 echo "    ,\"$mirror\"" >> "$temp_config"
             fi
         done
     fi
+    echo "  ]," >> "$temp_config"
     
+    # Add other Docker configuration
     cat >> "$temp_config" << EOF
-  ],
   "log-driver": "json-file",
   "log-opts": {
     "max-size": "10m",
     "max-file": "3"
   },
-  "storage-driver": "overlay2"
+  "storage-driver": "overlay2",
+  "live-restore": true,
+  "userland-proxy": false,
+  "experimental": false
 }
 EOF
 
+    # Validate JSON syntax
+    if ! python3 -m json.tool "$temp_config" >/dev/null 2>&1 && ! python -m json.tool "$temp_config" >/dev/null 2>&1; then
+        log_error "Generated Docker configuration is not valid JSON"
+        cat "$temp_config"
+        rm -f "$temp_config"
+        return 1
+    fi
+    
     # Install the new configuration
     sudo cp "$temp_config" "$docker_daemon_config"
+    sudo chmod 644 "$docker_daemon_config"
     rm -f "$temp_config"
     
-    # Restart Docker daemon
-    log_info "Restarting Docker daemon to apply new configuration..."
-    sudo systemctl daemon-reload
-    sudo systemctl restart docker
+    log_info "Docker daemon configuration updated"
     
-    # Wait for Docker to start
+    # Check if Docker is running before restart
+    local docker_was_running=false
+    if sudo systemctl is-active --quiet docker; then
+        docker_was_running=true
+        log_info "Docker service is currently running"
+    fi
+    
+    # Reload systemd and restart Docker with better error handling
+    log_info "Reloading systemd configuration..."
+    sudo systemctl daemon-reload
+    
+    if [[ "$docker_was_running" == true ]]; then
+        log_info "Stopping Docker service gracefully..."
+        sudo systemctl stop docker || {
+            log_warning "Failed to stop Docker gracefully, forcing stop..."
+            sudo pkill -f dockerd || true
+            sleep 2
+        }
+    fi
+    
+    # Start Docker service
+    log_info "Starting Docker service with new configuration..."
+    if sudo systemctl start docker; then
+        log_success "Docker service started successfully"
+    else
+        log_error "Failed to start Docker service"
+        log_info "Checking systemctl status..."
+        sudo systemctl status docker --no-pager || true
+        log_info "Checking journalctl logs..."
+        sudo journalctl -xeu docker.service --no-pager -n 20 || true
+        
+        # Try to restore backup and restart
+        if [[ -f "${docker_daemon_config}.backup."* ]]; then
+            log_warning "Attempting to restore backup configuration..."
+            local backup_file=$(ls -t "${docker_daemon_config}.backup."* | head -1)
+            sudo cp "$backup_file" "$docker_daemon_config"
+            sudo systemctl start docker && log_info "Docker restored with backup config" || log_error "Failed to restore Docker"
+        fi
+        return 1
+    fi
+    
+    # Wait for Docker to be fully ready
     local retry_count=0
+    log_info "Waiting for Docker daemon to be ready..."
     while ! docker info >/dev/null 2>&1 && [[ $retry_count -lt 30 ]]; do
-        log_info "Waiting for Docker daemon to start... ($((retry_count + 1))/30)"
+        log_info "Waiting for Docker daemon... ($((retry_count + 1))/30)"
         sleep 2
         ((retry_count++))
     done
     
     if docker info >/dev/null 2>&1; then
-        log_success "Docker daemon restarted successfully"
+        log_success "Docker daemon is ready and accessible"
+        # Test registry access
+        log_info "Testing registry configuration..."
+        if docker pull hello-world:latest >/dev/null 2>&1; then
+            log_success "Registry configuration test passed"
+            docker rmi hello-world:latest >/dev/null 2>&1 || true
+        else
+            log_warning "Registry test failed, but Docker is running"
+        fi
     else
-        log_error "Docker daemon failed to start after configuration change"
-        exit 1
+        log_error "Docker daemon is not accessible after restart"
+        log_info "Please check: sudo systemctl status docker"
+        log_info "And logs with: sudo journalctl -xeu docker.service"
+        return 1
     fi
 }
 
@@ -232,8 +550,78 @@ start_minikube() {
         return 0
     fi
     
-    # Configure Docker daemon for insecure registries
-    configure_docker_daemon
+# Alternative method to configure Docker without restart
+configure_docker_alternative() {
+    log_info "Configuring Docker using alternative method (no restart required)..."
+    
+    # Export environment variables for current session
+    export DOCKER_BUILDKIT=0
+    export DOCKER_CLI_EXPERIMENTAL=enabled
+    
+    # Create a systemd override for docker service
+    local override_dir="/etc/systemd/system/docker.service.d"
+    sudo mkdir -p "$override_dir"
+    
+    cat <<EOF | sudo tee "$override_dir/override.conf" >/dev/null
+[Service]
+ExecStart=
+ExecStart=/usr/bin/dockerd --insecure-registry=10.0.0.0/8 --insecure-registry=172.16.0.0/12 --insecure-registry=192.168.0.0/16 --insecure-registry=europe-docker.pkg.dev --insecure-registry=*.pkg.dev --insecure-registry=gcr.io --insecure-registry=k8s.gcr.io --insecure-registry=registry.k8s.io -H fd:// --containerd=/run/containerd/containerd.sock
+EOF
+    
+    log_success "Alternative Docker configuration applied"
+}
+
+# Skip Docker configuration if it causes issues
+skip_docker_config() {
+    log_warning "Skipping Docker daemon configuration due to service issues"
+    log_info "Docker is running with default configuration"
+    log_info "You may need to manually configure insecure registries if image pulls fail"
+}
+
+# Start minikube with enterprise settings and better error handling
+start_minikube() {
+    log_info "Starting enterprise Kubernetes cluster..."
+    
+    # Load registry settings if available
+    local registry_config="$CONFIG_DIR/registry.conf"
+    if [[ -f "$registry_config" ]]; then
+        source "$registry_config"
+    fi
+    
+    # Check if already running
+    if command_exists minikube && minikube status -p "$PROFILE_NAME" 2>/dev/null | grep -q "Running"; then
+        log_warning "Kubernetes cluster is already running"
+        show_cluster_info
+        return 0
+    fi
+    
+    # Configure Docker daemon for insecure registries with error handling
+    if docker info >/dev/null 2>&1; then
+        if is_docker_desktop; then
+            log_info "Docker Desktop detected - using Desktop-specific configuration"
+            if configure_docker_desktop; then
+                log_success "Docker Desktop configuration completed"
+            else
+                log_warning "Docker Desktop configuration had issues, continuing anyway"
+            fi
+        else
+            log_info "Native Docker installation detected"
+            if configure_docker_daemon; then
+                log_success "Docker configuration updated successfully"
+            else
+                log_warning "Docker configuration failed, trying alternative method..."
+                if configure_docker_alternative; then
+                    log_info "Alternative Docker configuration applied"
+                    sudo systemctl daemon-reload
+                else
+                    log_warning "Alternative configuration also failed"
+                    skip_docker_config
+                fi
+            fi
+        fi
+    else
+        log_warning "Docker not accessible, skipping daemon configuration"
+    fi
     
     # Pre-pull images to avoid download issues during cluster start
     pre_pull_images
@@ -415,12 +803,23 @@ install_docker() {
     log_warning "Please logout and login again (or run 'newgrp docker') to use Docker without sudo"
 }
 
-# Check system requirements
+# Check system requirements with WSL/Docker Desktop awareness
 check_requirements() {
     log_info "Checking system requirements..."
     
     # Check OS support
     check_os_support
+    
+    # Check if we're in WSL
+    if is_wsl; then
+        log_info "WSL environment detected"
+        log_info "WSL Distro: ${WSL_DISTRO_NAME:-Unknown}"
+        
+        # Check Windows Docker Desktop integration
+        if [[ -f "/mnt/c/Program Files/Docker/Docker/Docker Desktop.exe" ]]; then
+            log_info "Docker Desktop found on Windows host"
+        fi
+    fi
     
     # Check for required commands
     local missing_deps=()
@@ -433,8 +832,15 @@ check_requirements() {
         missing_deps+=("curl")
     fi
     
-    if [[ "$MINIKUBE_DRIVER" == "virtualbox" ]] && ! command_exists vboxmanage; then
-        missing_deps+=("virtualbox")
+    # Only check for VirtualBox if not using Docker Desktop and driver is VirtualBox
+    if [[ "$MINIKUBE_DRIVER" == "virtualbox" ]] && ! is_docker_desktop && ! command_exists vboxmanage; then
+        if is_wsl; then
+            log_warning "VirtualBox driver not recommended in WSL. Consider using Docker driver instead."
+            log_info "Setting driver to docker for WSL compatibility"
+            MINIKUBE_DRIVER="docker"
+        else
+            missing_deps+=("virtualbox")
+        fi
     fi
     
     # Install missing basic dependencies
@@ -456,21 +862,33 @@ check_requirements() {
         done
     fi
     
-    # Handle Docker installation/check
+    # Handle Docker installation/check with Docker Desktop awareness
     if [[ "$MINIKUBE_DRIVER" == "docker" ]]; then
         if ! command_exists docker; then
             log_info "Docker not found. Installing Docker..."
             install_docker
         elif ! docker info >/dev/null 2>&1; then
-            log_info "Docker is installed but not accessible. Checking permissions..."
-            if ! groups "$USER" | grep -q docker; then
-                log_warning "User is not in docker group. Adding user to docker group..."
-                sudo usermod -aG docker "$USER"
-                log_warning "Please logout and login again, then re-run this script"
-                exit 1
+            if is_wsl && is_docker_desktop; then
+                log_info "Docker Desktop detected but not accessible. Checking integration..."
+                log_warning "Please ensure WSL integration is enabled in Docker Desktop settings"
             else
-                log_info "Starting Docker service..."
-                sudo systemctl start docker
+                log_info "Docker is installed but not accessible. Checking permissions..."
+                if ! groups "$USER" | grep -q docker; then
+                    log_warning "User is not in docker group. Adding user to docker group..."
+                    sudo usermod -aG docker "$USER"
+                    log_warning "Please logout and login again, then re-run this script"
+                    exit 1
+                else
+                    log_info "Starting Docker service..."
+                    sudo systemctl start docker
+                fi
+            fi
+        else
+            log_success "Docker is accessible"
+            if is_docker_desktop; then
+                log_info "Using Docker Desktop"
+            else
+                log_info "Using native Docker installation"
             fi
         fi
     fi
@@ -777,6 +1195,8 @@ COMMANDS:
     install-docker     Install Docker only (Ubuntu/Debian)
     configure-registry Configure container registry mirrors and Kubernetes image repository
     configure-mirror   Configure enterprise mirror for binaries
+    fix-docker         Fix Docker service issues
+    troubleshoot       Run diagnostics and show troubleshooting information
     help               Show this help message
 
 OPTIONS:
@@ -791,12 +1211,20 @@ OPTIONS:
 EXAMPLES:
     $0 fresh-install                           # Fresh installation with Docker, Minikube, kubectl
     $0 fresh-install --memory 8192 --cpus 4   # Fresh install with more resources
-    $0 install-docker                          # Install Docker only
-    $0 start --driver virtualbox              # Start with VirtualBox driver
+    $0 install-docker                          # Install Docker only (or configure Docker Desktop)
+    $0 start --driver virtualbox              # Start with VirtualBox driver (not recommended in WSL)
+    $0 start --driver docker                  # Start with Docker driver (recommended for WSL/Docker Desktop)
     $0 status                                  # Show cluster status
     $0 delete --profile my-cluster            # Delete specific profile
     $0 configure-registry                      # Configure registry mirrors and Kubernetes image repository
     $0 start --image-repository europe-docker.pkg.dev/mgmt-bak-bld-1d47/staging/ap/edh/a107595/images/platform-tools/registry.k8s.io # Use custom registry
+
+WSL/DOCKER DESKTOP NOTES:
+    - In WSL with Docker Desktop, ensure WSL 2 integration is enabled
+    - Go to Docker Desktop > Settings > Resources > WSL Integration
+    - Enable integration with your WSL distribution
+    - Docker daemon configuration is managed through Docker Desktop settings
+    - For insecure registries, configure them in Docker Desktop > Settings > Docker Engine
 
 EOF
 }
@@ -878,6 +1306,37 @@ configure_mirror() {
 # Troubleshooting function for common issues
 troubleshoot() {
     log_info "Running troubleshooting diagnostics..."
+    
+    echo "=== WSL Information ==="
+    if is_wsl; then
+        echo "WSL Environment: Yes"
+        echo "WSL Distro: ${WSL_DISTRO_NAME:-Unknown}"
+        echo "WSL Version: $(wsl.exe --version 2>/dev/null | head -1 || echo 'Unknown')"
+        
+        # Check Docker Desktop integration
+        echo "Docker Desktop Integration:"
+        if [[ -f "/mnt/c/Program Files/Docker/Docker/Docker Desktop.exe" ]]; then
+            echo "  ✓ Docker Desktop found on Windows"
+        else
+            echo "  ✗ Docker Desktop not found on Windows"
+        fi
+        
+        if [[ -S /var/run/docker.sock ]]; then
+            echo "  ✓ Docker socket accessible in WSL"
+        else
+            echo "  ✗ Docker socket not accessible in WSL"
+        fi
+        
+        # Check Windows path accessibility
+        if command -v powershell.exe >/dev/null 2>&1; then
+            echo "  ✓ Windows PowerShell accessible from WSL"
+        else
+            echo "  ✗ Windows PowerShell not accessible from WSL"
+        fi
+    else
+        echo "WSL Environment: No"
+    fi
+    echo
     
     echo "=== System Information ==="
     uname -a
@@ -1021,6 +1480,9 @@ main() {
             ;;
         configure-mirror)
             configure_mirror
+            ;;
+        fix-docker)
+            fix_docker_service
             ;;
         troubleshoot)
             troubleshoot
