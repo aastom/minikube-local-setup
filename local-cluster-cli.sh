@@ -33,12 +33,14 @@ KUBE_SCHEDULER_IMAGE=""
 KUBE_PROXY_IMAGE=""
 ETCD_IMAGE=""
 COREDNS_IMAGE=""
+STORAGE_PROVISIONER_IMAGE=""
 
 # Default image versions
 PAUSE_VERSION="3.9"
 KUBE_VERSION="v1.31.1"
 ETCD_VERSION="3.5.15-0"
 COREDNS_VERSION="v1.11.1"
+STORAGE_PROVISIONER_VERSION="v5"
 
 # Create config directory
 mkdir -p "$CONFIG_DIR"
@@ -250,6 +252,7 @@ pre_pull_images() {
         "kube-proxy:$(get_image_url "proxy" "$KUBE_PROXY_IMAGE" "kube-proxy" "$KUBE_VERSION")"
         "etcd:$(get_image_url "etcd" "$ETCD_IMAGE" "etcd" "$ETCD_VERSION")"
         "coredns:$(get_image_url "coredns" "$COREDNS_IMAGE" "coredns" "$COREDNS_VERSION")"
+        "storage-provisioner:$(get_image_url "storage-provisioner" "$STORAGE_PROVISIONER_IMAGE" "storage-provisioner" "$STORAGE_PROVISIONER_VERSION")"
     )
     
     for image_spec in "${images[@]}"; do
@@ -349,6 +352,12 @@ start_minikube() {
     if [[ -n "$ETCD_IMAGE" ]]; then
         start_cmd+=" --extra-config=etcd.image=\"$ETCD_IMAGE\""
         log_info "Using custom etcd image: $ETCD_IMAGE"
+    fi
+    
+    # Add custom storage-provisioner image
+    if [[ -n "$STORAGE_PROVISIONER_IMAGE" ]]; then
+        start_cmd+=" --extra-config=storage-provisioner.image=\"$STORAGE_PROVISIONER_IMAGE\""
+        log_info "Using custom storage-provisioner image: $STORAGE_PROVISIONER_IMAGE"
     fi
     
     # Start cluster with retry logic
@@ -578,6 +587,7 @@ OPTIONS:
     --proxy IMAGE      Custom kube-proxy image URL
     --etcd IMAGE       Custom etcd image URL
     --coredns IMAGE    Custom coredns image URL
+    --storage IMAGE    Custom storage-provisioner image URL
 
 EXAMPLES:
     $0 fresh-install                                     # Complete setup with defaults
@@ -600,7 +610,8 @@ INDIVIDUAL IMAGE OVERRIDE EXAMPLES:
         --controller "my-registry.com/kube-controller-manager:v1.31.1" \\
         --proxy "my-registry.com/kube-proxy:v1.31.1" \\
         --etcd "my-registry.com/etcd:3.5.15-0" \\
-        --coredns "my-registry.com/coredns:v1.11.1"
+        --coredns "my-registry.com/coredns:v1.11.1" \\
+        --storage "my-registry.com/storage-provisioner:v5"
 
 EOF
 }
@@ -651,6 +662,10 @@ parse_args() {
                 ;;
             --coredns)
                 COREDNS_IMAGE="$2"
+                shift 2
+                ;;
+            --storage)
+                STORAGE_PROVISIONER_IMAGE="$2"
                 shift 2
                 ;;
             *)
