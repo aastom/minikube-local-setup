@@ -927,7 +927,7 @@ EXAMPLES:
     $0 fresh-install                                     # Complete setup with defaults
     $0 configure-images                                  # Interactive image configuration
     $0 start --memory 8192 --cpus 4                     # Start with more resources
-    $0 start --pause "my-registry.com/pause:3.9" \\
+    $0 start --pause "my-registry.com/pause:3.10" \\
              --apiserver "my-registry.com/kube-apiserver:v1.31.1"
     $0 clean-images                                      # Remove cached images
     $0 troubleshoot                                      # Run full diagnostics
@@ -941,7 +941,7 @@ INDIVIDUAL IMAGE OVERRIDE EXAMPLES:
     # Use custom images from your private registry
     $0 start \\
         --kicbase "my-registry.com/kicbase:v0.0.44" \\
-        --pause "my-registry.com/pause:3.9" \\
+        --pause "my-registry.com/pause:3.10" \\
         --apiserver "my-registry.com/kube-apiserver:v1.31.1" \\
         --scheduler "my-registry.com/kube-scheduler:v1.31.1" \\
         --controller "my-registry.com/kube-controller-manager:v1.31.1" \\
