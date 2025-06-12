@@ -656,27 +656,42 @@ use_minikube_docker_daemon() {
     fi
 }
 
+# Clean up problematic minikube configuration
+clean_minikube_config() {
+    log_info "Cleaning up minikube configuration..."
+    
+    # Remove any problematic config settings
+    minikube config unset pull-policy -p "$PROFILE_NAME" 2>/dev/null || true
+    minikube config unset image-pull-policy -p "$PROFILE_NAME" 2>/dev/null || true
+    
+    # Clear global settings too
+    minikube config unset pull-policy 2>/dev/null || true
+    minikube config unset image-pull-policy 2>/dev/null || true
+    
+    log_info "Minikube configuration cleaned"
+}
+
 # Configure minikube to use local images
 configure_minikube_local_images() {
-    log_info "Configuring minikube to prefer local images..."
+    log_info "Configuring minikube settings..."
     
-    # Set minikube to use local docker daemon and prefer local images
+    # First clean any problematic settings
+    clean_minikube_config
+    
+    # Set basic minikube configuration
     minikube config set driver "$MINIKUBE_DRIVER" -p "$PROFILE_NAME" 2>/dev/null || true
-    minikube config set image-mirror-country "" -p "$PROFILE_NAME" 2>/dev/null || true
-    minikube config set image-repository "" -p "$PROFILE_NAME" 2>/dev/null || true
     
-    # Configure environment to skip pulling if images exist locally
-    # This works with older minikube versions
-    export MINIKUBE_PULL_POLICY="IfNotPresent"
-    export MINIKUBE_IMAGE_PULL_POLICY="IfNotPresent"
-    
-    # For Docker driver, ensure we're using the same Docker daemon
+    # For Docker driver, we don't need special pull policy configuration
+    # since we'll load images directly after cluster starts
     if [[ "$MINIKUBE_DRIVER" == "docker" ]]; then
-        log_info "Configuring Docker driver for local image access..."
-        # The docker driver shares the host docker daemon, so local images should be available
+        log_info "Docker driver will use image loading after cluster starts"
+    else
+        # For other drivers, try to set image preferences
+        minikube config set image-mirror-country "" -p "$PROFILE_NAME" 2>/dev/null || true
+        minikube config set image-repository "" -p "$PROFILE_NAME" 2>/dev/null || true
     fi
     
-    log_success "Minikube configured to prefer local images"
+    log_success "Minikube configuration updated"
 }
 
 # Start minikube cluster
@@ -747,13 +762,8 @@ start_minikube() {
         "--delete-on-failure"
     )
     
-    # Add pull policy flag only if supported
-    if [[ "${MINIKUBE_SUPPORTS_PULL_POLICY:-false}" == "true" ]]; then
-        start_args+=("--pull-policy=IfNotPresent")
-        log_info "Added --pull-policy=IfNotPresent flag"
-    else
-        log_info "Using environment variables for pull policy (older minikube version)"
-    fi
+    # Note: Removed --pull-policy flag completely as it's not supported in older minikube versions
+    # We'll handle image preferences through minikube image load after cluster starts
     
     # Add custom kicbase image if specified
     if [[ -n "$KICBASE_IMAGE" ]]; then
@@ -801,6 +811,10 @@ start_minikube() {
     log_info "CPUs: $MINIKUBE_CPUS"
     log_info "Image overrides: $image_overrides_count"
     
+    # Clear any environment variables that might interfere
+    unset MINIKUBE_PULL_POLICY
+    unset MINIKUBE_IMAGE_PULL_POLICY
+    
     # Start cluster with retry logic
     local retry_count=0
     local max_retries=3
@@ -813,6 +827,9 @@ start_minikube() {
         
         set +e  # Temporarily disable exit on error
         log_info "Starting minikube with timeout of ${start_timeout} seconds..."
+        
+        # Debug: Show the exact command being executed
+        log_info "Executing: minikube start ${start_args[*]}"
         
         # Use timeout command to prevent hanging
         timeout $start_timeout minikube start "${start_args[@]}"
