@@ -356,19 +356,19 @@ get_minikube_image_tags() {
 pre_pull_and_tag_images() {
     log_info "Pre-pulling and tagging required Kubernetes images..."
     
-    # Define image mappings: component:custom_url:default_component:version
-    local image_mappings=(
-        "pause:${PAUSE_IMAGE}:pause:${PAUSE_VERSION}"
-        "kube-apiserver:${KUBE_APISERVER_IMAGE}:kube-apiserver:${KUBE_VERSION}"
-        "kube-controller-manager:${KUBE_CONTROLLER_MANAGER_IMAGE}:kube-controller-manager:${KUBE_VERSION}"
-        "kube-scheduler:${KUBE_SCHEDULER_IMAGE}:kube-scheduler:${KUBE_VERSION}"
-        "kube-proxy:${KUBE_PROXY_IMAGE}:kube-proxy:${KUBE_VERSION}"
-        "etcd:${ETCD_IMAGE}:etcd:${ETCD_VERSION}"
-        "coredns:${COREDNS_IMAGE}:coredns:${COREDNS_VERSION}"
-        "storage-provisioner:${STORAGE_PROVISIONER_IMAGE}:storage-provisioner:${STORAGE_PROVISIONER_VERSION}"
+    # Define image specifications: component_name|custom_image_var|default_component|default_version
+    declare -A image_specs=(
+        ["pause"]="PAUSE_IMAGE|pause|${PAUSE_VERSION}"
+        ["kube-apiserver"]="KUBE_APISERVER_IMAGE|kube-apiserver|${KUBE_VERSION}"
+        ["kube-controller-manager"]="KUBE_CONTROLLER_MANAGER_IMAGE|kube-controller-manager|${KUBE_VERSION}"
+        ["kube-scheduler"]="KUBE_SCHEDULER_IMAGE|kube-scheduler|${KUBE_VERSION}"
+        ["kube-proxy"]="KUBE_PROXY_IMAGE|kube-proxy|${KUBE_VERSION}"
+        ["etcd"]="ETCD_IMAGE|etcd|${ETCD_VERSION}"
+        ["coredns"]="COREDNS_IMAGE|coredns|${COREDNS_VERSION}"
+        ["storage-provisioner"]="STORAGE_PROVISIONER_IMAGE|storage-provisioner|${STORAGE_PROVISIONER_VERSION}"
     )
     
-    # Also pre-pull kicbase if specified
+    # Also pre-pull kicbase if specified (exact URL as provided)
     if [[ -n "$KICBASE_IMAGE" ]]; then
         log_info "Pre-pulling kicbase: $KICBASE_IMAGE"
         if docker pull "$KICBASE_IMAGE" 2>/dev/null; then
@@ -383,64 +383,74 @@ pre_pull_and_tag_images() {
     local pull_successes=0
     local tag_successes=0
     
-    for mapping in "${image_mappings[@]}"; do
-        IFS=':' read -r component custom_url default_component version <<< "$mapping"
+    for component in "${!image_specs[@]}"; do
+        IFS='|' read -r custom_var default_component default_version <<< "${image_specs[$component]}"
         
-        # Determine source image URL
+        # Get the custom image URL using indirect variable reference
+        local custom_image_url="${!custom_var}"
+        
+        # Determine source image URL - use exact custom URL if provided
         local source_image
-        if [[ -n "$custom_url" ]]; then
-            source_image="$custom_url"
+        if [[ -n "$custom_image_url" ]]; then
+            source_image="$custom_image_url"
+            log_info "Processing $component with custom image: $source_image"
         else
-            source_image="${DEFAULT_REGISTRY}/${default_component}:${version}"
+            source_image="${DEFAULT_REGISTRY}/${default_component}:${default_version}"
+            log_info "Processing $component with default image: $source_image"
         fi
         
-        # Get expected minikube tag
+        # Get expected minikube tag (what minikube expects to find locally)
         local minikube_tag
-        minikube_tag=$(get_minikube_image_tags "$component" "$version")
+        minikube_tag=$(get_minikube_image_tags "$component" "$default_version")
         
-        log_info "Processing $component: $source_image"
-        
-        # Pull the image
+        # Pull the exact image URL as specified
         if docker pull "$source_image" 2>/dev/null; then
-            log_success "Successfully pulled $source_image"
+            log_success "Successfully pulled: $source_image"
             ((pull_successes++))
             
             # Tag for minikube if different from source
             if [[ "$source_image" != "$minikube_tag" ]]; then
                 if docker tag "$source_image" "$minikube_tag" 2>/dev/null; then
-                    log_success "Tagged as $minikube_tag"
+                    log_success "Tagged as: $minikube_tag"
                     ((tag_successes++))
                 else
                     log_warning "Failed to tag $source_image as $minikube_tag"
                 fi
             else
-                log_info "Image already has correct tag for minikube"
+                log_info "Image already has correct tag for minikube: $minikube_tag"
                 ((tag_successes++))
             fi
         else
-            log_warning "Failed to pull $source_image, trying fallback registries"
+            log_warning "Failed to pull: $source_image"
             
-            # Try alternative registries for standard images
-            local fallback_success=false
-            
-            for alt_reg in "k8s.gcr.io" "gcr.io/k8s-minikube"; do
-                local alt_image="${alt_reg}/${default_component}:${version}"
-                log_info "Trying fallback: $alt_image"
-                if docker pull "$alt_image" 2>/dev/null; then
-                    if docker tag "$alt_image" "$minikube_tag" 2>/dev/null; then
-                        log_success "Tagged fallback $alt_image as $minikube_tag"
-                        fallback_success=true
-                        ((pull_successes++))
-                        ((tag_successes++))
-                        break
-                    else
-                        log_warning "Failed to tag $alt_image as $minikube_tag"
+            # Only try fallback registries if using default images (not custom URLs)
+            if [[ -z "$custom_image_url" ]]; then
+                log_info "Trying fallback registries for default image..."
+                local fallback_success=false
+                
+                for alt_reg in "k8s.gcr.io" "gcr.io/k8s-minikube"; do
+                    local alt_image="${alt_reg}/${default_component}:${default_version}"
+                    log_info "Trying fallback: $alt_image"
+                    if docker pull "$alt_image" 2>/dev/null; then
+                        if docker tag "$alt_image" "$minikube_tag" 2>/dev/null; then
+                            log_success "Tagged fallback $alt_image as $minikube_tag"
+                            fallback_success=true
+                            ((pull_successes++))
+                            ((tag_successes++))
+                            break
+                        else
+                            log_warning "Failed to tag $alt_image as $minikube_tag"
+                        fi
                     fi
+                done
+                
+                if [[ "$fallback_success" != true ]]; then
+                    log_warning "All fallback attempts failed for $component"
+                    ((pull_failures++))
                 fi
-            done
-            
-            if [[ "$fallback_success" != true ]]; then
-                log_warning "All attempts failed for $component"
+            else
+                log_warning "Custom image URL failed, no fallback attempted for $component"
+                log_info "Please verify the custom image URL: $custom_image_url"
                 ((pull_failures++))
             fi
         fi
@@ -927,7 +937,7 @@ EXAMPLES:
     $0 fresh-install                                     # Complete setup with defaults
     $0 configure-images                                  # Interactive image configuration
     $0 start --memory 8192 --cpus 4                     # Start with more resources
-    $0 start --pause "my-registry.com/pause:3.10" \\
+    $0 start --pause "my-registry.com/pause:3.9" \\
              --apiserver "my-registry.com/kube-apiserver:v1.31.1"
     $0 clean-images                                      # Remove cached images
     $0 troubleshoot                                      # Run full diagnostics
@@ -937,18 +947,30 @@ CONFIGURATION FILES:
     ~/.local-cluster-cli/cluster.log        # Installation and runtime logs
     ~/.local-cluster-cli/image-manifest.txt # Local image cache manifest
 
+CUSTOM IMAGE BEHAVIOR:
+    - Custom image URLs are pulled EXACTLY as specified (full URL with tag)
+    - Images are then tagged with names that minikube expects locally
+    - Fallback registries are ONLY used for default images, not custom URLs
+    - If a custom image URL fails, no fallback is attempted
+
 INDIVIDUAL IMAGE OVERRIDE EXAMPLES:
-    # Use custom images from your private registry
+    # Use exact custom images from your private registry
     $0 start \\
-        --kicbase "my-registry.com/kicbase:v0.0.44" \\
-        --pause "my-registry.com/pause:3.10" \\
-        --apiserver "my-registry.com/kube-apiserver:v1.31.1" \\
-        --scheduler "my-registry.com/kube-scheduler:v1.31.1" \\
-        --controller "my-registry.com/kube-controller-manager:v1.31.1" \\
-        --proxy "my-registry.com/kube-proxy:v1.31.1" \\
-        --etcd "my-registry.com/etcd:3.5.15-0" \\
-        --coredns "my-registry.com/coredns:v1.11.1" \\
-        --storage "my-registry.com/storage-provisioner:v5"
+        --kicbase "my-registry.com/minikube/kicbase:v0.0.44" \\
+        --pause "my-registry.com/k8s/pause:3.9" \\
+        --apiserver "my-registry.com/k8s/kube-apiserver:v1.31.1" \\
+        --scheduler "my-registry.com/k8s/kube-scheduler:v1.31.1" \\
+        --controller "my-registry.com/k8s/kube-controller-manager:v1.31.1" \\
+        --proxy "my-registry.com/k8s/kube-proxy:v1.31.1" \\
+        --etcd "my-registry.com/k8s/etcd:3.5.15-0" \\
+        --coredns "my-registry.com/k8s/coredns:v1.11.1" \\
+        --storage "my-registry.com/minikube/storage-provisioner:v5"
+    
+    # Mix custom and default images
+    $0 start \\
+        --pause "harbor.company.com/k8s/pause:3.9" \\
+        --apiserver "quay.io/custom/kube-apiserver:v1.31.1"
+        # Other components will use registry.k8s.io defaults
 
 DEFAULT IMAGES (when no custom URLs specified):
     kicbase: gcr.io/k8s-minikube/kicbase:latest
