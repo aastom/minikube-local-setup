@@ -1,5 +1,6 @@
+#!/bin/bash
 
-# Enterprise Kubernetes Local Cluster Management Tool
+# Enterprise Kubernetes Local Cluster Management Tool for WSL with Windows Docker
 # Usage: ./local-cluster-cli.sh [COMMAND] [OPTIONS]
 
 set -e
@@ -9,34 +10,24 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Enterprise environment configuration
-WGET_FLAGS="--no-check-certificate --timeout=60 --tries=5 --retry-connrefused"
-CURL_FLAGS="--insecure --connect-timeout 60 --retry 5 --retry-connrefused"
-APT_FLAGS="-o Acquire::https::Verify-Peer=false -o Acquire::https::Verify-Host=false"
-HTTP_PROXY_ENV=""
-HTTPS_PROXY_ENV=""
-NO_PROXY_ENV="localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local,.internal"
-MINIKUBE_MEMORY="8192"
+# Configuration
+MINIKUBE_MEMORY="4096"
 MINIKUBE_CPUS="2"
-MINIKUBE_DISK_SIZE="40g"
+MINIKUBE_DISK_SIZE="50g"
 MINIKUBE_DRIVER="docker"
 KUBECTL_VERSION="v1.31.1"
 PROFILE_NAME="enterprise-k8s"
-REGISTRY_MIRRORS=""
 INSECURE_REGISTRIES="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,europe-docker.pkg.dev"
+IMAGE_REPOSITORY="europe-docker.pkg.dev/mgmt-bak-bld-1d47/staging/ap/edh/a107595/images/platform-tools/registry.k8s.io"
 CONFIG_DIR="$HOME/.local-cluster-cli"
 LOG_FILE="$CONFIG_DIR/cluster.log"
-# Enterprise mirror for binaries
-ENTERPRISE_MIRROR=""
-# Default image repository - updated based on the image
-IMAGE_REPOSITORY="europe-docker.pkg.dev/mgmt-bak-bld-1d47/staging/ap/edh/a107595/images/platform-tools/registry.k8s.io"
 
-# Create config directory if it doesn't exist
+# Create config directory
 mkdir -p "$CONFIG_DIR"
 
-# Logging functions with timestamps
+# Logging functions
 log() {
     local level=$1
     local message=$2
@@ -44,248 +35,196 @@ log() {
     echo -e "[$timestamp] $level $message" | tee -a "$LOG_FILE"
 }
 
-log_info() {
-    log "${BLUE}INFO${NC}" "$1"
-}
+log_info() { log "${BLUE}INFO${NC}" "$1"; }
+log_success() { log "${GREEN}SUCCESS${NC}" "$1"; }
+log_warning() { log "${YELLOW}WARNING${NC}" "$1"; }
+log_error() { log "${RED}ERROR${NC}" "$1"; }
 
-log_success() {
-    log "${GREEN}SUCCESS${NC}" "$1"
-}
-
-log_warning() {
-    log "${YELLOW}WARNING${NC}" "$1"
-}
-
-log_error() {
-    log "${RED}ERROR${NC}" "$1"
-}
-
-# Check if running in WSL environment
+# Check if running in WSL
 is_wsl() {
     [[ -n "${WSL_DISTRO_NAME:-}" ]] || [[ -n "${WSL_INTEROP:-}" ]] || [[ -f /proc/sys/fs/binfmt_misc/WSLInterop ]] || grep -qi microsoft /proc/version 2>/dev/null
 }
 
-# Configure Docker Desktop connection via URL/TCP
-configure_docker_desktop_url() {
-    log_info "Configuring Docker Desktop connection via URL..."
-    
-    # Check if TCP connection is available
-    local docker_tcp_host="tcp://localhost:2375"
-    local docker_tcp_tls_host="tcp://localhost:2376"
-    
-    # Test TCP connection (non-TLS)
-    if DOCKER_HOST="$docker_tcp_host" docker info >/dev/null 2>&1; then
-        log_success "Docker Desktop TCP connection (non-TLS) is available"
-        export DOCKER_HOST="$docker_tcp_host"
-        echo "export DOCKER_HOST=\"$docker_tcp_host\"" >> ~/.bashrc
-        log_info "Set DOCKER_HOST to $docker_tcp_host"
-        return 0
-    fi
-    
-    # Test TCP connection (TLS)
-    if DOCKER_HOST="$docker_tcp_tls_host" docker info >/dev/null 2>&1; then
-        log_success "Docker Desktop TCP connection (TLS) is available"
-        export DOCKER_HOST="$docker_tcp_tls_host"
-        echo "export DOCKER_HOST=\"$docker_tcp_tls_host\"" >> ~/.bashrc
-        log_info "Set DOCKER_HOST to $docker_tcp_tls_host"
-        return 0
-    fi
-    
-    # Check various socket locations
-    local socket_locations=(
-        "unix:///var/run/docker.sock"
-        "unix:///mnt/wsl/shared-docker/docker.sock"
-        "unix://$HOME/.docker/desktop/docker.sock"
+# Find Windows Docker executable
+find_windows_docker() {
+    local docker_paths=(
+        "/mnt/c/Program Files/Docker/Docker/resources/bin/docker.exe"
+        "/mnt/c/Program Files/Docker/Docker/resources/docker.exe"
+        "/mnt/c/ProgramData/DockerDesktop/version-bin/docker.exe"
     )
     
-    for socket in "${socket_locations[@]}"; do
-        if DOCKER_HOST="$socket" docker info >/dev/null 2>&1; then
-            log_success "Docker socket found at: $socket"
-            export DOCKER_HOST="$socket"
-            echo "export DOCKER_HOST=\"$socket\"" >> ~/.bashrc
-            log_info "Set DOCKER_HOST to $socket"
+    for path in "${docker_paths[@]}"; do
+        if [[ -f "$path" ]]; then
+            echo "$path"
             return 0
         fi
     done
-    
-    log_error "No working Docker connection found"
-    log_info "To enable TCP connection:"
-    log_info "1. Open Docker Desktop"
-    log_info "2. Go to Settings > General"
-    log_info "3. Enable 'Expose daemon on tcp://localhost:2375 without TLS'"
-    log_info "4. Apply & Restart"
     return 1
 }
 
-# Check if Docker Desktop is available via URL
-is_docker_desktop_url() {
-    # Check if DOCKER_HOST is set to a Docker Desktop endpoint
-    [[ -n "${DOCKER_HOST:-}" ]] && (
-        [[ "${DOCKER_HOST}" == *"localhost:2375"* ]] || 
-        [[ "${DOCKER_HOST}" == *"localhost:2376"* ]] ||
-        [[ "${DOCKER_HOST}" == *"docker.sock"* ]]
-    )
-}
-
-# Check if Docker Desktop WSL integration is working properly
-check_docker_desktop_integration() {
-    if ! is_wsl; then
-        return 0  # Not in WSL, skip check
-    fi
-    
-    log_info "Checking Docker Desktop integration options..."
-    
-    # First, try Windows Docker.exe directly
-    if check_windows_docker; then
-        log_info "Windows Docker.exe found, testing connectivity..."
-        if "$WINDOWS_DOCKER_PATH" info >/dev/null 2>&1; then
-            log_success "Windows Docker.exe is working - using direct Windows Docker"
-            setup_windows_docker
-            return 0
-        else
-            log_warning "Windows Docker.exe found but not accessible"
-        fi
-    fi
-    
-    # Check if Docker Desktop is installed on Windows
-    if [[ ! -f "/mnt/c/Program Files/Docker/Docker/Docker Desktop.exe" ]]; then
-        log_warning "Docker Desktop not found on Windows host"
-        return 1
-    fi
-    
-    # Test basic Docker connectivity via WSL integration
-    if docker_info_wrapper >/dev/null 2>&1; then
-        log_success "Docker Desktop WSL integration is working"
-        return 0
-    else
-        log_error "Docker Desktop WSL integration is not working"
-        log_info "Will attempt to use Windows Docker.exe directly"
-        
-        if check_windows_docker && setup_windows_docker; then
-            log_success "Successfully configured Windows Docker.exe wrapper"
-            return 0
-        else
-            log_error "Both WSL integration and Windows Docker.exe failed"
-            log_info "Common fixes:"
-            log_info "1. Open Docker Desktop and restart WSL integration"
-            log_info "2. Go to Settings > Resources > WSL Integration"
-            log_info "3. Disable and re-enable integration with your distro"
-            log_info "4. If that fails, run these commands in Windows PowerShell as Administrator:"
-            log_info "   wsl --shutdown"
-            log_info "   wsl --start ${WSL_DISTRO_NAME:-Ubuntu}"
-            log_info "5. Restart Docker Desktop"
-            return 1
-        fi
-    fi
-}
-
-# Configure Docker Desktop integration
-configure_docker_desktop() {
-    log_info "Configuring Docker Desktop integration for WSL..."
+# Setup Windows Docker wrapper
+setup_windows_docker() {
+    log_info "Setting up Windows Docker.exe wrapper..."
     
     if ! is_wsl; then
-        log_warning "Not running in WSL environment"
-        return 1
+        log_error "This script is designed for WSL environments only"
+        exit 1
     fi
     
-    # Check Docker Desktop integration status first
-    if ! check_docker_desktop_integration; then
-        log_error "Docker Desktop WSL integration is not working properly"
-        log_info "Please fix the integration issue before continuing"
-        log_info "You may need to restart Docker Desktop or reset WSL integration"
-        return 1
+    local windows_docker_path
+    if ! windows_docker_path=$(find_windows_docker); then
+        log_error "Windows Docker.exe not found. Please install Docker Desktop on Windows."
+        exit 1
     fi
     
-    log_success "Docker Desktop is accessible from WSL"
+    log_info "Found Windows Docker at: $windows_docker_path"
     
-    # For Docker Desktop, we don't modify daemon.json directly
-    # Instead, we configure it through Docker Desktop settings or use docker context
+    # Create wrapper directory and script
+    mkdir -p "$HOME/.local/bin"
+    local docker_wrapper="$HOME/.local/bin/docker"
     
-    # Check current Docker context
-    local current_context=$(docker context show 2>/dev/null || echo "default")
-    log_info "Current Docker context: $current_context"
-    
-    # Create a custom context for enterprise settings if needed
-    if [[ "$current_context" != "enterprise" ]]; then
-        log_info "Creating enterprise Docker context..."
-        
-        # Get current Docker endpoint
-        local docker_host=$(docker context inspect "$current_context" --format '{{.Endpoints.docker.Host}}' 2>/dev/null || echo "unix:///var/run/docker.sock")
-        
-        # Create enterprise context with custom settings
-        if docker context create enterprise --docker "host=$docker_host" 2>/dev/null; then
-            log_success "Created enterprise Docker context"
-        else
-            log_info "Enterprise context already exists or using default"
-        fi
-    fi
-    
-    # Configure Docker Desktop settings through registry modifications (if needed)
-    configure_docker_desktop_registry_settings
-    
-    return 0
-}
-
-# Configure registry settings for Docker Desktop
-configure_docker_desktop_registry_settings() {
-    log_info "Configuring registry settings for Docker Desktop..."
-    
-    # Create Docker CLI config directory if it doesn't exist
-    local docker_config_dir="$HOME/.docker"
-    mkdir -p "$docker_config_dir"
-    
-    # Create or update Docker CLI config for insecure registries
-    local cli_config="$docker_config_dir/config.json"
-    local temp_config="/tmp/docker_cli_config.json"
-    
-    # Build the configuration
-    cat > "$temp_config" << EOF
-{
-  "auths": {},
-  "experimental": "disabled",
-  "insecureRegistries": [
-    "10.0.0.0/8",
-    "172.16.0.0/12",
-    "192.168.0.0/16",
-    "europe-docker.pkg.dev",
-    "*.pkg.dev",
-    "gcr.io",
-    "k8s.gcr.io",
-    "registry.k8s.io",
-    "localhost",
-    "127.0.0.1"
-  ]
-}
+    cat > "$docker_wrapper" << EOF
+#!/bin/bash
+exec "$windows_docker_path" "\$@"
 EOF
-
-    # Merge with existing config if it exists
-    if [[ -f "$cli_config" ]]; then
-        log_info "Backing up existing Docker CLI config"
-        cp "$cli_config" "${cli_config}.backup.$(date +%s)"
-        
-        # Try to merge configurations (simplified approach)
-        if command_exists jq; then
-            jq -s '.[0] * .[1]' "$cli_config" "$temp_config" > "${temp_config}.merged" 2>/dev/null && mv "${temp_config}.merged" "$temp_config"
-        fi
+    
+    chmod +x "$docker_wrapper"
+    
+    # Add to PATH
+    if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+        echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+        export PATH="$HOME/.local/bin:$PATH"
     fi
     
-    mv "$temp_config" "$cli_config"
-    log_success "Docker CLI configuration updated"
-    
-    # Note about Docker Desktop settings
-    log_warning "Note: For full insecure registry support in Docker Desktop:"
-    log_info "1. Open Docker Desktop"
-    log_info "2. Go to Settings > Docker Engine"
-    log_info "3. Add insecure registries to the JSON configuration:"
-    log_info '   "insecure-registries": ["europe-docker.pkg.dev", "*.pkg.dev", "10.0.0.0/8"]'
-    log_info "4. Click 'Apply & Restart'"
+    # Test Docker wrapper
+    if "$docker_wrapper" version >/dev/null 2>&1; then
+        log_success "Windows Docker wrapper configured successfully"
+        "$docker_wrapper" version --format "Client: {{.Client.Version}}, Server: {{.Server.Version}}"
+    else
+        log_error "Docker wrapper test failed. Ensure Docker Desktop is running on Windows."
+        exit 1
+    fi
 }
 
-# Pre-pull required images using wget/docker where possible
+# Check if command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Install missing dependencies
+install_dependencies() {
+    log_info "Installing required dependencies..."
+    
+    local missing_deps=()
+    for cmd in wget curl; do
+        if ! command_exists "$cmd"; then
+            missing_deps+=("$cmd")
+        fi
+    done
+    
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        log_info "Installing: ${missing_deps[*]}"
+        sudo apt-get update -qq
+        sudo apt-get install -y "${missing_deps[@]}"
+    fi
+}
+
+# Download and install binary
+download_and_install() {
+    local name=$1
+    local urls=("${@:2}")
+    local binary_name=""
+    local temp_file="/tmp/${name}"
+    
+    # Determine binary name based on OS and architecture
+    local os="linux"
+    local arch
+    case "$(uname -m)" in
+        x86_64) arch="amd64" ;;
+        arm64|aarch64) arch="arm64" ;;
+        *) log_error "Unsupported architecture: $(uname -m)"; exit 1 ;;
+    esac
+    
+    if [[ "$name" == "minikube" ]]; then
+        binary_name="minikube-${os}-${arch}"
+        temp_file="/tmp/${binary_name}"
+    else
+        binary_name="$name"
+    fi
+    
+    # Try downloading from each URL
+    local download_success=false
+    for url in "${urls[@]}"; do
+        local full_url="${url}${binary_name}"
+        log_info "Downloading $name from: $full_url"
+        
+        if wget --no-check-certificate --timeout=30 -O "$temp_file" "$full_url" 2>/dev/null || \
+           curl --insecure --connect-timeout 30 -L -o "$temp_file" "$full_url" 2>/dev/null; then
+            download_success=true
+            break
+        fi
+    done
+    
+    if [[ "$download_success" != true ]] || [[ ! -s "$temp_file" ]]; then
+        log_error "Failed to download $name"
+        exit 1
+    fi
+    
+    # Install binary
+    chmod +x "$temp_file"
+    sudo mv "$temp_file" "/usr/local/bin/$name"
+    
+    # Verify installation
+    if "$name" version >/dev/null 2>&1 || "$name" version --client >/dev/null 2>&1; then
+        log_success "$name installed successfully"
+    else
+        log_error "$name installation verification failed"
+        exit 1
+    fi
+}
+
+# Install minikube
+install_minikube() {
+    log_info "Installing Minikube..."
+    
+    local urls=(
+        "https://github.com/kubernetes/minikube/releases/latest/download/"
+        "https://storage.googleapis.com/minikube/releases/latest/"
+    )
+    
+    download_and_install "minikube" "${urls[@]}"
+    minikube version
+}
+
+# Install kubectl
+install_kubectl() {
+    log_info "Installing kubectl..."
+    
+    local version="$KUBECTL_VERSION"
+    if [[ -z "$version" ]]; then
+        version=$(wget --no-check-certificate -qO- "https://dl.k8s.io/release/stable.txt" 2>/dev/null || echo "v1.31.1")
+    fi
+    
+    local os="linux"
+    local arch
+    case "$(uname -m)" in
+        x86_64) arch="amd64" ;;
+        arm64|aarch64) arch="arm64" ;;
+    esac
+    
+    local urls=(
+        "https://dl.k8s.io/release/${version}/bin/${os}/${arch}/"
+        "https://storage.googleapis.com/kubernetes-release/release/${version}/bin/${os}/${arch}/"
+    )
+    
+    download_and_install "kubectl" "${urls[@]}"
+    kubectl version --client
+}
+
+# Pre-pull required images
 pre_pull_images() {
     log_info "Pre-pulling required Kubernetes images..."
     
-    # Define required images with fallback URLs
     local images=(
         "pause:3.9"
         "kube-apiserver:v1.31.1"
@@ -296,328 +235,43 @@ pre_pull_images() {
         "coredns:v1.11.1"
     )
     
-    # Try to pre-pull images using docker (with wrapper support)
-    if command_exists docker && docker_info_wrapper >/dev/null 2>&1; then
-        for image in "${images[@]}"; do
-            local full_image=""
-            if [[ -n "$IMAGE_REPOSITORY" ]]; then
-                full_image="${IMAGE_REPOSITORY}/k8s-minikube/${image}"
-            else
-                full_image="registry.k8s.io/${image}"
-            fi
-            
-            log_info "Attempting to pull image: $full_image"
-            if ! docker_pull_wrapper "$full_image" 2>/dev/null; then
-                log_warning "Failed to pull $full_image, will try fallback during cluster start"
-                # Try alternative registries
-                local alt_registries=("k8s.gcr.io" "gcr.io/k8s-minikube")
-                for alt_reg in "${alt_registries[@]}"; do
-                    local alt_image="${alt_reg}/${image}"
-                    log_info "Trying alternative registry: $alt_image"
-                    if docker_pull_wrapper "$alt_image" 2>/dev/null; then
-                        # Tag the image for the expected repository (if using regular docker)
-                        if ! is_wsl || [[ -z "${WINDOWS_DOCKER_PATH:-}" ]]; then
-                            docker tag "$alt_image" "$full_image" 2>/dev/null || true
-                        fi
-                        break
-                    fi
-                done
-            fi
-        done
-    fi
-}
-
-# Configure registry mirrors
-configure_registry_mirrors() {
-    log_info "Configuring container registry mirrors..."
-    
-    # Prompt for registry mirrors
-    read -p "Docker Hub mirror URL (leave empty to skip): " dockerhub_mirror
-    read -p "Additional registry mirrors (comma-separated, leave empty to skip): " additional_mirrors
-    read -p "Kubernetes image registry (default: ${IMAGE_REPOSITORY}): " k8s_registry
-    read -p "Custom image repository prefix (leave empty to use default): " custom_image_repository
-    
-    # Combine mirrors
-    local mirrors=""
-    [[ -n "$dockerhub_mirror" ]] && mirrors="$dockerhub_mirror"
-    [[ -n "$additional_mirrors" ]] && mirrors="${mirrors:+$mirrors,}$additional_mirrors"
-    
-    # Set default for Kubernetes registry if empty
-    [[ -z "$k8s_registry" ]] && k8s_registry="$IMAGE_REPOSITORY"
-    
-    # Save to config file
-    local registry_config="$CONFIG_DIR/registry.conf"
-    echo "# Registry configuration - $(date)" > "$registry_config"
-    echo "REGISTRY_MIRRORS=\"$mirrors\"" >> "$registry_config"
-    echo "INSECURE_REGISTRIES=\"$INSECURE_REGISTRIES\"" >> "$registry_config"
-    echo "K8S_REGISTRY=\"$k8s_registry\"" >> "$registry_config"
-    echo "IMAGE_REPOSITORY=\"${custom_image_repository:-$IMAGE_REPOSITORY}\"" >> "$registry_config"
-    
-    log_success "Registry settings saved to $registry_config"
-    
-    # Update current settings
-    REGISTRY_MIRRORS="$mirrors"
-    K8S_REGISTRY="$k8s_registry"
-    IMAGE_REPOSITORY="${custom_image_repository:-$IMAGE_REPOSITORY}"
-}
-
-# Configure Docker daemon for insecure registries with Docker Desktop awareness
-configure_docker_daemon() {
-    # If Docker Desktop is detected, use different configuration approach
-    if is_docker_desktop; then
-        log_info "Docker Desktop detected, using Desktop-specific configuration..."
-        return configure_docker_desktop
-    fi
-    
-    log_info "Configuring Docker daemon for enterprise registries..."
-    
-    local docker_daemon_config="/etc/docker/daemon.json"
-    local temp_config="/tmp/daemon.json"
-    local existing_config=""
-    
-    # Create backup if file exists and read existing config
-    if [[ -f "$docker_daemon_config" ]]; then
-        sudo cp "$docker_daemon_config" "${docker_daemon_config}.backup.$(date +%s)"
-        log_info "Backed up existing Docker daemon configuration"
-        existing_config=$(sudo cat "$docker_daemon_config" 2>/dev/null || echo "{}")
-    else
-        existing_config="{}"
-    fi
-    
-    # Create Docker config directory if it doesn't exist
-    sudo mkdir -p /etc/docker
-    
-    # Build insecure registries array
-    local insecure_registries=(
-        "10.0.0.0/8"
-        "172.16.0.0/12" 
-        "192.168.0.0/16"
-        "europe-docker.pkg.dev"
-        "*.pkg.dev"
-        "gcr.io"
-        "k8s.gcr.io"
-        "registry.k8s.io"
-        "localhost"
-        "127.0.0.1"
-    )
-    
-    # Create new daemon configuration with better error handling
-    cat > "$temp_config" << EOF
-{
-  "insecure-registries": [
-EOF
-    
-    # Add insecure registries
-    local first=true
-    for registry in "${insecure_registries[@]}"; do
-        if [[ "$first" == true ]]; then
-            echo "    \"$registry\"" >> "$temp_config"
-            first=false
-        else
-            echo "    ,\"$registry\"" >> "$temp_config"
-        fi
-    done
-    
-    echo "  ]," >> "$temp_config"
-    
-    # Add registry mirrors if configured
-    echo "  \"registry-mirrors\": [" >> "$temp_config"
-    if [[ -n "$REGISTRY_MIRRORS" ]]; then
-        IFS=',' read -ra MIRRORS <<< "$REGISTRY_MIRRORS"
-        local mirror_first=true
-        for mirror in "${MIRRORS[@]}"; do
-            [[ -z "$mirror" ]] && continue
-            if [[ "$mirror_first" == true ]]; then
-                echo "    \"$mirror\"" >> "$temp_config"
-                mirror_first=false
-            else
-                echo "    ,\"$mirror\"" >> "$temp_config"
-            fi
-        done
-    fi
-    echo "  ]," >> "$temp_config"
-    
-    # Add other Docker configuration
-    cat >> "$temp_config" << EOF
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "10m",
-    "max-file": "3"
-  },
-  "storage-driver": "overlay2",
-  "live-restore": true,
-  "userland-proxy": false,
-  "experimental": false
-}
-EOF
-
-    # Validate JSON syntax
-    if ! python3 -m json.tool "$temp_config" >/dev/null 2>&1 && ! python -m json.tool "$temp_config" >/dev/null 2>&1; then
-        log_error "Generated Docker configuration is not valid JSON"
-        cat "$temp_config"
-        rm -f "$temp_config"
-        return 1
-    fi
-    
-    # Install the new configuration
-    sudo cp "$temp_config" "$docker_daemon_config"
-    sudo chmod 644 "$docker_daemon_config"
-    rm -f "$temp_config"
-    
-    log_info "Docker daemon configuration updated"
-    
-    # Check if Docker is running before restart
-    local docker_was_running=false
-    if sudo systemctl is-active --quiet docker; then
-        docker_was_running=true
-        log_info "Docker service is currently running"
-    fi
-    
-    # Reload systemd and restart Docker with better error handling
-    log_info "Reloading systemd configuration..."
-    sudo systemctl daemon-reload
-    
-    if [[ "$docker_was_running" == true ]]; then
-        log_info "Stopping Docker service gracefully..."
-        sudo systemctl stop docker || {
-            log_warning "Failed to stop Docker gracefully, forcing stop..."
-            sudo pkill -f dockerd || true
-            sleep 2
-        }
-    fi
-    
-    # Start Docker service
-    log_info "Starting Docker service with new configuration..."
-    if sudo systemctl start docker; then
-        log_success "Docker service started successfully"
-    else
-        log_error "Failed to start Docker service"
-        log_info "Checking systemctl status..."
-        sudo systemctl status docker --no-pager || true
-        log_info "Checking journalctl logs..."
-        sudo journalctl -xeu docker.service --no-pager -n 20 || true
+    for image in "${images[@]}"; do
+        local full_image="${IMAGE_REPOSITORY}/k8s-minikube/${image}"
+        log_info "Pulling: $full_image"
         
-        # Try to restore backup and restart
-        if [[ -f "${docker_daemon_config}.backup."* ]]; then
-            log_warning "Attempting to restore backup configuration..."
-            local backup_file=$(ls -t "${docker_daemon_config}.backup."* | head -1)
-            sudo cp "$backup_file" "$docker_daemon_config"
-            sudo systemctl start docker && log_info "Docker restored with backup config" || log_error "Failed to restore Docker"
+        if ! docker pull "$full_image" 2>/dev/null; then
+            log_warning "Failed to pull $full_image, trying fallback"
+            # Try alternative registries
+            for alt_reg in "k8s.gcr.io" "gcr.io/k8s-minikube"; do
+                local alt_image="${alt_reg}/${image}"
+                if docker pull "$alt_image" 2>/dev/null; then
+                    docker tag "$alt_image" "$full_image" 2>/dev/null || true
+                    break
+                fi
+            done
         fi
-        return 1
-    fi
-    
-    # Wait for Docker to be fully ready
-    local retry_count=0
-    log_info "Waiting for Docker daemon to be ready..."
-    while ! docker info >/dev/null 2>&1 && [[ $retry_count -lt 30 ]]; do
-        log_info "Waiting for Docker daemon... ($((retry_count + 1))/30)"
-        sleep 2
-        ((retry_count++))
     done
-    
-    if docker info >/dev/null 2>&1; then
-        log_success "Docker daemon is ready and accessible"
-        # Test registry access
-        log_info "Testing registry configuration..."
-        if docker pull hello-world:latest >/dev/null 2>&1; then
-            log_success "Registry configuration test passed"
-            docker rmi hello-world:latest >/dev/null 2>&1 || true
-        else
-            log_warning "Registry test failed, but Docker is running"
-        fi
-    else
-        log_error "Docker daemon is not accessible after restart"
-        log_info "Please check: sudo systemctl status docker"
-        log_info "And logs with: sudo journalctl -xeu docker.service"
-        return 1
-    fi
 }
 
-# Alternative method to configure Docker without restart
-configure_docker_alternative() {
-    log_info "Configuring Docker using alternative method (no restart required)..."
-    
-    # Export environment variables for current session
-    export DOCKER_BUILDKIT=0
-    export DOCKER_CLI_EXPERIMENTAL=enabled
-    
-    # Create a systemd override for docker service
-    local override_dir="/etc/systemd/system/docker.service.d"
-    sudo mkdir -p "$override_dir"
-    
-    cat <<EOF | sudo tee "$override_dir/override.conf" >/dev/null
-[Service]
-ExecStart=
-ExecStart=/usr/bin/dockerd --insecure-registry=10.0.0.0/8 --insecure-registry=172.16.0.0/12 --insecure-registry=192.168.0.0/16 --insecure-registry=europe-docker.pkg.dev --insecure-registry=*.pkg.dev --insecure-registry=gcr.io --insecure-registry=k8s.gcr.io --insecure-registry=registry.k8s.io -H fd:// --containerd=/run/containerd/containerd.sock
-EOF
-    
-    log_success "Alternative Docker configuration applied"
-}
-
-# Skip Docker configuration if it causes issues
-skip_docker_config() {
-    log_warning "Skipping Docker daemon configuration due to service issues"
-    log_info "Docker is running with default configuration"
-    log_info "You may need to manually configure insecure registries if image pulls fail"
-}
-
-# Start minikube with enterprise settings and better error handling
+# Start minikube cluster
 start_minikube() {
-    log_info "Starting enterprise Kubernetes cluster..."
-    
-    # Load registry settings if available
-    local registry_config="$CONFIG_DIR/registry.conf"
-    if [[ -f "$registry_config" ]]; then
-        source "$registry_config"
-    fi
+    log_info "Starting Kubernetes cluster..."
     
     # Check if already running
     if command_exists minikube && minikube status -p "$PROFILE_NAME" 2>/dev/null | grep -q "Running"; then
-        log_warning "Kubernetes cluster is already running"
+        log_warning "Cluster is already running"
         show_cluster_info
         return 0
     fi
     
-    # Configure Docker daemon for insecure registries with error handling
-    if docker_info_wrapper >/dev/null 2>&1; then
-        if is_wsl && [[ -n "${WINDOWS_DOCKER_PATH:-}" ]]; then
-            log_info "Using Windows Docker.exe - registry configuration handled by Docker Desktop"
-            log_warning "To configure insecure registries:"
-            log_info "1. Open Docker Desktop on Windows"
-            log_info "2. Go to Settings > Docker Engine"
-            log_info "3. Add insecure registries to the JSON configuration"
-            log_info "4. Apply & Restart Docker Desktop"
-        elif is_docker_desktop; then
-            log_info "Docker Desktop detected - using Desktop-specific configuration"
-            if configure_docker_desktop; then
-                log_success "Docker Desktop configuration completed"
-            else
-                log_warning "Docker Desktop configuration had issues, continuing anyway"
-            fi
-        else
-            log_info "Native Docker installation detected"
-            if configure_docker_daemon; then
-                log_success "Docker configuration updated successfully"
-            else
-                log_warning "Docker configuration failed, trying alternative method..."
-                if configure_docker_alternative; then
-                    log_info "Alternative Docker configuration applied"
-                    sudo systemctl daemon-reload
-                else
-                    log_warning "Alternative configuration also failed"
-                    skip_docker_config
-                fi
-            fi
-        fi
+    # Pre-pull images
+    if docker info >/dev/null 2>&1; then
+        pre_pull_images
     else
-        log_warning "Docker not accessible, skipping daemon configuration"
+        log_warning "Docker not accessible, skipping image pre-pull"
     fi
     
-    # Pre-pull images to avoid download issues during cluster start
-    pre_pull_images
-    
-    # Prepare start command with enterprise settings
+    # Build minikube start command
     local start_cmd="minikube start"
     start_cmd+=" --driver=$MINIKUBE_DRIVER"
     start_cmd+=" --memory=$MINIKUBE_MEMORY"
@@ -625,40 +279,15 @@ start_minikube() {
     start_cmd+=" --disk-size=$MINIKUBE_DISK_SIZE"
     start_cmd+=" --profile=$PROFILE_NAME"
     start_cmd+=" --insecure-registry=\"$INSECURE_REGISTRIES\""
+    start_cmd+=" --image-repository=\"$IMAGE_REPOSITORY\""
     start_cmd+=" --embed-certs=true"
-    start_cmd+=" --force-systemd=true"
-    start_cmd+=" --extra-config=kubeadm.ignore-preflight-errors=NumCPU"
-    start_cmd+=" --extra-config=kubelet.resolv-conf=/run/systemd/resolve/resolv.conf"
     
-    # Add registry mirrors if configured
-    if [[ -n "$REGISTRY_MIRRORS" ]]; then
-        IFS=',' read -ra MIRRORS <<< "$REGISTRY_MIRRORS"
-        for mirror in "${MIRRORS[@]}"; do
-            [[ -n "$mirror" ]] && start_cmd+=" --registry-mirror=$mirror"
-        done
-    fi
-    
-    # Add custom image repository if configured
-    if [[ -n "$IMAGE_REPOSITORY" ]]; then
-        start_cmd+=" --image-repository=\"$IMAGE_REPOSITORY\""
-        log_info "Using custom image repository: $IMAGE_REPOSITORY"
-    fi
-    
-    # Additional Docker-specific settings for enterprise environments
-    if [[ "$MINIKUBE_DRIVER" == "docker" ]]; then
-        start_cmd+=" --docker-opt=default-address-pool=base=192.168.64.0/16,size=24"
-        start_cmd+=" --docker-env=HTTP_PROXY=${HTTP_PROXY:-}"
-        start_cmd+=" --docker-env=HTTPS_PROXY=${HTTPS_PROXY:-}"
-        start_cmd+=" --docker-env=NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,10.96.0.0/12,192.168.0.0/16,172.17.0.0/16}"
-    fi
-    
-    # Start the cluster with retry logic
-    log_info "Starting Kubernetes cluster with enterprise settings..."
+    # Start cluster with retry logic
     local retry_count=0
     local max_retries=3
     
     while [[ $retry_count -lt $max_retries ]]; do
-        log_info "Cluster start attempt $((retry_count + 1))/$max_retries"
+        log_info "Starting cluster (attempt $((retry_count + 1))/$max_retries)..."
         
         if eval "$start_cmd"; then
             log_success "Cluster started successfully!"
@@ -666,13 +295,11 @@ start_minikube() {
         else
             ((retry_count++))
             if [[ $retry_count -lt $max_retries ]]; then
-                log_warning "Cluster start failed, cleaning up and retrying..."
+                log_warning "Start failed, cleaning up and retrying..."
                 minikube delete -p "$PROFILE_NAME" 2>/dev/null || true
                 sleep 10
             else
                 log_error "Failed to start cluster after $max_retries attempts"
-                log_error "Please check the logs and try manual troubleshooting"
-                log_info "You can run 'minikube logs -p $PROFILE_NAME' for more details"
                 exit 1
             fi
         fi
@@ -688,831 +315,194 @@ start_minikube() {
         fi
         sleep 5
         ((ready_retry++))
-        log_info "Waiting for cluster... ($ready_retry/60)"
     done
     
-    # Enable useful addons with error handling
-    log_info "Enabling enterprise addons..."
-    local addons=("dashboard" "metrics-server" "ingress" "registry")
-    
-    for addon in "${addons[@]}"; do
-        log_info "Enabling addon: $addon"
-        if minikube addons enable "$addon" -p "$PROFILE_NAME"; then
+    # Enable essential addons
+    log_info "Enabling addons..."
+    for addon in dashboard metrics-server ingress; do
+        if minikube addons enable "$addon" -p "$PROFILE_NAME" 2>/dev/null; then
             log_success "Enabled $addon addon"
         else
-            log_warning "Failed to enable $addon addon - continuing anyway"
+            log_warning "Failed to enable $addon addon"
         fi
     done
     
-    log_success "Enterprise Kubernetes cluster started successfully!"
     show_cluster_info
 }
 
-# Check if command exists
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-# Check if running on Ubuntu/Debian
-check_os_support() {
-    if [[ ! -f /etc/os-release ]]; then
-        log_error "Cannot determine operating system"
-        exit 1
-    fi
-    
-    source /etc/os-release
-    case $ID in
-        ubuntu|debian)
-            log_info "Detected $PRETTY_NAME"
-            ;;
-        *)
-            log_warning "This script is optimized for Ubuntu/Debian systems"
-            log_warning "Docker installation may not work on $PRETTY_NAME"
-            ;;
-    esac
-}
-
-# Install Docker on Ubuntu/Debian with Docker Desktop awareness
-install_docker() {
-    log_info "Installing Docker..."
-    
-    # Check if we're in WSL with Docker Desktop
-    if is_wsl; then
-        log_info "WSL environment detected"
-        
-        # First, try to use Windows Docker directly
-        if check_windows_docker; then
-            log_info "Windows Docker.exe found, setting up direct access..."
-            if setup_windows_docker; then
-                log_success "Windows Docker.exe configured successfully"
-                return 0
-            fi
-        fi
-        
-        # Check if Docker Desktop is already accessible via WSL integration
-        if docker_info_wrapper >/dev/null 2>&1; then
-            log_success "Docker Desktop is already accessible from WSL"
-            configure_docker_desktop
-            return 0
-        fi
-        
-        # Check if Docker Desktop might be installed but not configured
-        if [[ -f "/mnt/c/Program Files/Docker/Docker/Docker Desktop.exe" ]] || [[ -f "/mnt/c/ProgramData/Docker/config/daemon.json" ]]; then
-            log_warning "Docker Desktop appears to be installed on Windows but not accessible from WSL"
-            
-            # Try Windows Docker.exe as fallback
-            if check_windows_docker && setup_windows_docker; then
-                log_success "Configured Windows Docker.exe as fallback"
-                return 0
-            fi
-            
-            log_info "Please enable WSL 2 integration in Docker Desktop:"
-            log_info "1. Open Docker Desktop on Windows"
-            log_info "2. Go to Settings > Resources > WSL Integration"
-            log_info "3. Enable integration with your WSL distro"
-            log_info "4. Apply & Restart Docker Desktop"
-            log_info "Alternatively, the script will try to install native Docker in WSL"
-        fi
-        
-        log_info "Docker Desktop not found. You can either:"
-        log_info "1. Install Docker Desktop on Windows (recommended for WSL)"
-        log_info "2. Install Docker CE in WSL (continuing with native installation)"
-        
-        read -p "Continue with native Docker installation in WSL? (y/N): " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            log_info "Please install Docker Desktop on Windows and enable WSL integration"
-            exit 1
-        fi
-    fi
-    
-    # Check if Docker is already installed (native installation)
-    if command_exists docker; then
-        log_info "Docker is already installed"
-        # Check if docker daemon is running
-        if docker_info_wrapper >/dev/null 2>&1; then
-            log_success "Docker is installed and running"
-            if is_wsl; then
-                configure_docker_desktop
-            fi
-            return 0
-        else
-            log_info "Docker is installed but not running. Starting Docker service..."
-            sudo systemctl start docker
-            sudo systemctl enable docker
-            return 0
-        fi
-    fi
-    
-    # Continue with native Docker installation...
-    log_info "Installing Docker natively in WSL/Linux..."
-    
-    # Update package index with corporate network settings
-    log_info "Updating package index..."
-    sudo apt-get $APT_FLAGS update
-    
-    # Remove any old Docker packages
-    log_info "Removing old Docker packages..."
-    sudo apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
-    
-    # Install required packages
-    log_info "Installing required packages..."
-    sudo apt-get $APT_FLAGS install -y \
-        apt-transport-https \
-        ca-certificates \
-        curl \
-        gnupg \
-        lsb-release \
-        software-properties-common
-    
-    # Install Docker directly from apt repositories (more reliable in enterprise environments)
-    log_info "Installing Docker from apt repositories..."
-    sudo apt-get $APT_FLAGS install -y docker.io docker-compose
-    
-    # Start and enable Docker service
-    log_info "Starting Docker service..."
-    sudo systemctl start docker
-    sudo systemctl enable docker
-    
-    # Add current user to docker group
-    log_info "Adding current user to docker group..."
-    sudo usermod -aG docker "$USER"
-    
-    # Test Docker installation
-    log_info "Testing Docker installation..."
-    if sudo docker run --rm hello-world >/dev/null 2>&1; then
-        log_success "Docker installed and configured successfully!"
-    else
-        log_warning "Docker installed but connectivity test failed (likely due to corporate firewall)"
-        log_success "Docker installation completed"
-    fi
-    
-    log_warning "Please logout and login again (or run 'newgrp docker') to use Docker without sudo"
-}
-
-# Check system requirements with WSL/Docker Desktop awareness
-check_requirements() {
-    log_info "Checking system requirements..."
-    
-    # Check OS support
-    check_os_support
-    
-    # Check if we're in WSL
-    if is_wsl; then
-        log_info "WSL environment detected"
-        log_info "WSL Distro: ${WSL_DISTRO_NAME:-Unknown}"
-        
-        # Check Windows Docker Desktop integration
-        if [[ -f "/mnt/c/Program Files/Docker/Docker/Docker Desktop.exe" ]]; then
-            log_info "Docker Desktop found on Windows host"
-        fi
-    fi
-    
-    # Check for required commands
-    local missing_deps=()
-    
-    if ! command_exists wget; then
-        missing_deps+=("wget")
-    fi
-    
-    if ! command_exists curl; then
-        missing_deps+=("curl")
-    fi
-    
-    # Only check for VirtualBox if not using Docker Desktop and driver is VirtualBox
-    if [[ "$MINIKUBE_DRIVER" == "virtualbox" ]] && ! is_docker_desktop && ! command_exists vboxmanage; then
-        if is_wsl; then
-            log_warning "VirtualBox driver not recommended in WSL. Consider using Docker driver instead."
-            log_info "Setting driver to docker for WSL compatibility"
-            MINIKUBE_DRIVER="docker"
-        else
-            missing_deps+=("virtualbox")
-        fi
-    fi
-    
-    # Install missing basic dependencies
-    if [[ ${#missing_deps[@]} -gt 0 ]]; then
-        log_info "Installing missing dependencies: ${missing_deps[*]}"
-        sudo apt-get $APT_FLAGS update
-        for dep in "${missing_deps[@]}"; do
-            case $dep in
-                wget)
-                    sudo apt-get $APT_FLAGS install -y wget
-                    ;;
-                curl)
-                    sudo apt-get $APT_FLAGS install -y curl
-                    ;;
-                virtualbox)
-                    sudo apt-get $APT_FLAGS install -y virtualbox
-                    ;;
-            esac
-        done
-    fi
-    
-    # Handle Docker installation/check with Docker Desktop awareness
-    if [[ "$MINIKUBE_DRIVER" == "docker" ]]; then
-        if ! command_exists docker; then
-            log_info "Docker not found. Installing Docker..."
-            install_docker
-        elif ! docker_info_wrapper >/dev/null 2>&1; then
-            if is_wsl; then
-                log_info "Docker not accessible in WSL, checking integration options..."
-                
-                # Try Windows Docker.exe first
-                if check_windows_docker && setup_windows_docker; then
-                    log_success "Configured Windows Docker.exe successfully"
-                elif is_docker_desktop; then
-                    log_info "Docker Desktop detected but not accessible. Checking integration..."
-                    log_warning "Please ensure WSL integration is enabled in Docker Desktop settings"
-                else
-                    log_info "Docker is installed but not accessible. Checking permissions..."
-                    if ! groups "$USER" | grep -q docker; then
-                        log_warning "User is not in docker group. Adding user to docker group..."
-                        sudo usermod -aG docker "$USER"
-                        log_warning "Please logout and login again, then re-run this script"
-                        exit 1
-                    else
-                        log_info "Starting Docker service..."
-                        sudo systemctl start docker
-                    fi
-                fi
-            else
-                log_info "Docker is installed but not accessible. Checking permissions..."
-                if ! groups "$USER" | grep -q docker; then
-                    log_warning "User is not in docker group. Adding user to docker group..."
-                    sudo usermod -aG docker "$USER"
-                    log_warning "Please logout and login again, then re-run this script"
-                    exit 1
-                else
-                    log_info "Starting Docker service..."
-                    sudo systemctl start docker
-                fi
-            fi
-        else
-            log_success "Docker is accessible"
-            if is_wsl && [[ -n "${WINDOWS_DOCKER_PATH:-}" ]]; then
-                log_info "Using Windows Docker.exe"
-            elif is_docker_desktop; then
-                log_info "Using Docker Desktop"
-            else
-                log_info "Using native Docker installation"
-            fi
-        fi
-    fi
-    
-    log_success "System requirements check passed"
-}
-
-# Install or update minikube with enterprise mirror support and wget fallback
-install_minikube() {
-    log_info "Installing/updating Minikube..."
-    
-    local os
-    case "$(uname -s)" in
-        Linux*)     os="linux" ;;
-        Darwin*)    os="darwin" ;;
-        *)          log_error "Unsupported operating system"; exit 1 ;;
-    esac
-    
-    local arch
-    case "$(uname -m)" in
-        x86_64)     arch="amd64" ;;
-        arm64)      arch="arm64" ;;
-        aarch64)    arch="arm64" ;;
-        *)          log_error "Unsupported architecture"; exit 1 ;;
-    esac
-    
-    # Download and install minikube
-    local minikube_binary="minikube-${os}-${arch}"
-    local minikube_url
-    local download_success=false
-    
-    # Try multiple download methods
-    local download_urls=(
-        "https://github.com/kubernetes/minikube/releases/latest/download/${minikube_binary}"
-        "https://storage.googleapis.com/minikube/releases/latest/${minikube_binary}"
-    )
-    
-    # Add enterprise mirror if configured
-    if [[ -n "$ENTERPRISE_MIRROR" ]]; then
-        download_urls=("${ENTERPRISE_MIRROR}/minikube/releases/latest/download/${minikube_binary}" "${download_urls[@]}")
-    fi
-    
-    for url in "${download_urls[@]}"; do
-        log_info "Trying to download Minikube from: $url"
-        
-        # Try wget first
-        if wget $WGET_FLAGS -O "${minikube_binary}" "$url" 2>/dev/null; then
-            download_success=true
-            log_success "Downloaded using wget"
-            break
-        fi
-        
-        # Try curl as fallback
-        if curl $CURL_FLAGS -L -o "${minikube_binary}" "$url" 2>/dev/null; then
-            download_success=true
-            log_success "Downloaded using curl"
-            break
-        fi
-        
-        log_warning "Failed to download from $url"
-    done
-    
-    if [[ "$download_success" != true ]]; then
-        # Check for local minikube binary
-        log_warning "All download attempts failed. Checking for local minikube binary..."
-        if [[ -f "$CONFIG_DIR/${minikube_binary}" ]]; then
-            log_info "Found local minikube binary. Installing..."
-            cp "$CONFIG_DIR/${minikube_binary}" "./${minikube_binary}"
-        else
-            log_error "No local minikube binary found."
-            log_info "Please manually download minikube and place it at:"
-            log_info "$CONFIG_DIR/${minikube_binary}"
-            log_info "Then run this command again."
-            exit 1
-        fi
-    fi
-    
-    # Verify the downloaded binary
-    if [[ ! -f "${minikube_binary}" ]] || [[ ! -s "${minikube_binary}" ]]; then
-        log_error "Downloaded minikube binary is missing or empty"
-        exit 1
-    fi
-    
-    # Install the binary
-    log_info "Installing minikube to /usr/local/bin/minikube..."
-    chmod +x "${minikube_binary}"
-    sudo install "${minikube_binary}" /usr/local/bin/minikube
-    
-    # Clean up the downloaded binary
-    rm -f "${minikube_binary}"
-    
-    # Verify installation
-    if minikube version >/dev/null 2>&1; then
-        log_success "Minikube installed successfully"
-        minikube version
-    else
-        log_error "Minikube installation verification failed"
-        exit 1
-    fi
-}
-
-# Install or update kubectl with wget fallback
-install_kubectl() {
-    log_info "Installing/updating kubectl..."
-    
-    local os
-    case "$(uname -s)" in
-        Linux*)     os="linux" ;;
-        Darwin*)    os="darwin" ;;
-        *)          log_error "Unsupported operating system"; exit 1 ;;
-    esac
-    
-    local arch
-    case "$(uname -m)" in
-        x86_64)     arch="amd64" ;;
-        arm64)      arch="arm64" ;;
-        aarch64)    arch="arm64" ;;
-        *)          log_error "Unsupported architecture"; exit 1 ;;
-    esac
-    
-    # Get kubectl version
-    local kubectl_version="$KUBECTL_VERSION"
-    if [[ -z "$kubectl_version" ]]; then
-        log_info "Getting latest kubectl version..."
-        # Try multiple methods to get version
-        for version_url in "https://dl.k8s.io/release/stable.txt" "https://storage.googleapis.com/kubernetes-release/release/stable.txt"; do
-            if kubectl_version=$(wget $WGET_FLAGS -qO- "$version_url" 2>/dev/null); then
-                break
-            fi
-            if kubectl_version=$(curl $CURL_FLAGS -s "$version_url" 2>/dev/null); then
-                break
-            fi
-        done
-        
-        if [[ -z "$kubectl_version" ]]; then
-            log_warning "Could not fetch latest version, using fallback version"
-            kubectl_version="v1.31.1"
-        fi
-    fi
-    
-    # Download and install kubectl
-    local kubectl_urls=(
-        "https://dl.k8s.io/release/${kubectl_version}/bin/${os}/${arch}/kubectl"
-        "https://storage.googleapis.com/kubernetes-release/release/${kubectl_version}/bin/${os}/${arch}/kubectl"
-    )
-    
-    local install_dir="/usr/local/bin"
-    local temp_kubectl="/tmp/kubectl"
-    local download_success=false
-    
-    for url in "${kubectl_urls[@]}"; do
-        log_info "Trying to download kubectl from: $url"
-        
-        # Try wget first
-        if wget $WGET_FLAGS -O "$temp_kubectl" "$url" 2>/dev/null; then
-            download_success=true
-            log_success "Downloaded using wget"
-            break
-        fi
-        
-        # Try curl as fallback
-        if curl $CURL_FLAGS -L -o "$temp_kubectl" "$url" 2>/dev/null; then
-            download_success=true
-            log_success "Downloaded using curl"
-            break
-        fi
-        
-        log_warning "Failed to download from $url"
-    done
-    
-    if [[ "$download_success" != true ]]; then
-        log_error "Failed to download kubectl from all sources"
-        exit 1
-    fi
-    
-    # Verify and install
-    if [[ ! -f "$temp_kubectl" ]] || [[ ! -s "$temp_kubectl" ]]; then
-        log_error "Downloaded kubectl binary is missing or empty"
-        exit 1
-    fi
-    
-    chmod +x "$temp_kubectl"
-    sudo mv "$temp_kubectl" "$install_dir/kubectl"
-    
-    # Verify installation
-    if kubectl version --client >/dev/null 2>&1; then
-        log_success "kubectl installed successfully"
-        kubectl version --client
-    else
-        log_error "kubectl installation verification failed"
-        exit 1
-    fi
-}
-
-# Fresh installation with improved error handling
-fresh_install() {
-    log_info "Starting fresh Minikube installation..."
-    
-    # Check if running as root (not recommended)
-    if [[ $EUID -eq 0 ]]; then
-        log_error "This script should not be run as root"
-        log_info "Please run as a regular user (the script will prompt for sudo when needed)"
-        exit 1
-    fi
-    
-    check_requirements
-    
-    # Install minikube and kubectl
-    install_minikube
-    install_kubectl
-    
-    # Delete existing cluster if it exists
-    if command_exists minikube && minikube status -p "$PROFILE_NAME" >/dev/null 2>&1; then
-        log_warning "Existing Minikube cluster found. Deleting..."
-        minikube delete -p "$PROFILE_NAME"
-    fi
-    
-    # Start minikube with specified configuration
-    start_minikube
-    
-    log_success "Fresh Minikube installation completed successfully!"
-    log_info "If you just installed Docker, you may need to logout and login again for group permissions to take effect"
-    show_cluster_info
-}
-
-# Stop minikube
+# Stop minikube cluster
 stop_minikube() {
-    log_info "Stopping Minikube cluster..."
+    log_info "Stopping cluster..."
     
     if ! command_exists minikube; then
         log_error "Minikube is not installed"
         exit 1
     fi
     
-    if ! minikube status -p "$PROFILE_NAME" 2>/dev/null | grep -q "Running"; then
-        log_warning "Minikube cluster is not running"
-        return 0
+    if minikube status -p "$PROFILE_NAME" 2>/dev/null | grep -q "Running"; then
+        minikube stop -p "$PROFILE_NAME"
+        log_success "Cluster stopped successfully!"
+    else
+        log_warning "Cluster is not running"
     fi
-    
-    minikube stop -p "$PROFILE_NAME"
-    log_success "Minikube cluster stopped successfully!"
 }
 
 # Delete minikube cluster
 delete_minikube() {
-    log_info "Deleting Minikube cluster..."
+    log_info "Deleting cluster..."
     
     if ! command_exists minikube; then
         log_error "Minikube is not installed"
         exit 1
     fi
     
-    # Confirm deletion
-    read -p "Are you sure you want to delete the Minikube cluster '$PROFILE_NAME'? (y/N): " -n 1 -r
+    read -p "Delete cluster '$PROFILE_NAME'? (y/N): " -n 1 -r
     echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        minikube delete -p "$PROFILE_NAME"
+        log_success "Cluster deleted successfully!"
+    else
         log_info "Deletion cancelled"
-        return 0
     fi
-    
-    minikube delete -p "$PROFILE_NAME"
-    log_success "Minikube cluster deleted successfully!"
 }
 
 # Show cluster information
 show_cluster_info() {
-    log_info "Cluster Information:"
-    echo "===================="
+    echo
+    echo "=== Cluster Information ==="
     
     if command_exists minikube && minikube status -p "$PROFILE_NAME" >/dev/null 2>&1; then
         echo "Profile: $PROFILE_NAME"
         minikube status -p "$PROFILE_NAME"
-        echo
         
         if minikube status -p "$PROFILE_NAME" 2>/dev/null | grep -q "Running"; then
-            echo "Cluster IP: $(minikube ip -p "$PROFILE_NAME" 2>/dev/null || echo 'Not available')"
-            echo "Dashboard URL: $(minikube dashboard --url -p "$PROFILE_NAME" 2>/dev/null || echo 'Not available')"
             echo
-            echo "Useful commands:"
+            echo "Cluster IP: $(minikube ip -p "$PROFILE_NAME" 2>/dev/null || echo 'Not available')"
+            echo "Dashboard: minikube dashboard -p $PROFILE_NAME"
+            echo
+            echo "Quick commands:"
             echo "  kubectl get nodes"
-            echo "  kubectl get pods --all-namespaces"
-            echo "  minikube dashboard -p $PROFILE_NAME"
+            echo "  kubectl get pods -A"
             echo "  minikube logs -p $PROFILE_NAME"
         fi
     else
         echo "No cluster found"
     fi
+    echo
 }
 
-# Fix Docker service issues
-fix_docker_service() {
-    log_info "Attempting to fix Docker service issues..."
-    
-    # Check current Docker status
-    log_info "Checking Docker service status..."
-    sudo systemctl status docker --no-pager || true
-    
-    # Check if Docker daemon config is causing issues
-    local docker_daemon_config="/etc/docker/daemon.json"
-    if [[ -f "$docker_daemon_config" ]]; then
-        log_info "Validating Docker daemon configuration..."
-        if ! python3 -m json.tool "$docker_daemon_config" >/dev/null 2>&1 && ! python -m json.tool "$docker_daemon_config" >/dev/null 2>&1; then
-            log_warning "Invalid JSON in Docker daemon config, backing up and removing..."
-            sudo mv "$docker_daemon_config" "${docker_daemon_config}.invalid.$(date +%s)"
-        fi
-    fi
-    
-    # Try to restart Docker service
-    log_info "Stopping Docker service..."
-    sudo systemctl stop docker || true
-    sudo systemctl stop docker.socket || true
-    
-    # Kill any remaining Docker processes
-    log_info "Cleaning up Docker processes..."
-    sudo pkill -f dockerd || true
-    sudo pkill -f docker-containerd || true
-    sleep 3
-    
-    # Remove Docker lock files if they exist
-    sudo rm -f /var/lib/docker/network/files/local-kv.db.lock || true
-    
-    # Start Docker service
-    log_info "Starting Docker service..."
-    if sudo systemctl start docker; then
-        log_success "Docker service started successfully"
-        
-        # Wait for Docker to be ready
-        local retry_count=0
-        while ! docker info >/dev/null 2>&1 && [[ $retry_count -lt 30 ]]; do
-            log_info "Waiting for Docker to be ready... ($((retry_count + 1))/30)"
-            sleep 2
-            ((retry_count++))
-        done
-        
-        if docker info >/dev/null 2>&1; then
-            log_success "Docker is now working properly"
-            docker version
-        else
-            log_error "Docker started but is not accessible"
-        fi
-    else
-        log_error "Failed to start Docker service"
-        log_info "Checking logs..."
-        sudo journalctl -xeu docker.service --no-pager -n 20 || true
-        
-        # Try with minimal configuration
-        log_info "Trying with minimal Docker configuration..."
-        sudo mkdir -p /etc/docker
-        echo '{"storage-driver": "overlay2"}' | sudo tee "$docker_daemon_config" >/dev/null
-        sudo systemctl daemon-reload
-        sudo systemctl start docker && log_success "Docker started with minimal config" || log_error "Docker still failing"
-    fi
-}
-
-# Troubleshooting function for common issues
+# Run diagnostics
 troubleshoot() {
-    log_info "Running troubleshooting diagnostics..."
-    
-    echo "=== WSL Information ==="
-    if is_wsl; then
-        echo "WSL Environment: Yes"
-        echo "WSL Distro: ${WSL_DISTRO_NAME:-Unknown}"
-        echo "WSL Version: $(wsl.exe --version 2>/dev/null | head -1 || echo 'Unknown')"
-        
-        # Check Docker Desktop integration
-        echo "Docker Desktop Integration:"
-        if [[ -f "/mnt/c/Program Files/Docker/Docker/Docker Desktop.exe" ]]; then
-            echo "  ✓ Docker Desktop found on Windows"
-            
-            # Test WSL integration
-            if docker info >/dev/null 2>&1; then
-                echo "  ✓ Docker socket accessible in WSL"
-            else
-                echo "  ✗ Docker socket not accessible in WSL"
-                echo "  ⚠ WSL integration may need to be restarted in Docker Desktop"
-            fi
-            
-            # Check for common WSL integration issues
-            if docker version >/dev/null 2>&1; then
-                echo "  ✓ Docker commands work properly"
-            else
-                echo "  ✗ Docker commands failing"
-                echo "  ⚠ Try: wsl --shutdown && restart Docker Desktop"
-            fi
-        else
-            echo "  ✗ Docker Desktop not found on Windows"
-        fi
-        
-        # Check Windows path accessibility
-        if command -v powershell.exe >/dev/null 2>&1; then
-            echo "  ✓ Windows PowerShell accessible from WSL"
-        else
-            echo "  ✗ Windows PowerShell not accessible from WSL"
-        fi
-    else
-        echo "WSL Environment: No"
-    fi
+    echo "=== Diagnostics ==="
     echo
     
-    echo "=== System Information ==="
-    uname -a
+    echo "WSL Environment: $(if is_wsl; then echo "Yes (${WSL_DISTRO_NAME:-Unknown})"; else echo "No"; fi)"
     echo
     
-    echo "=== Docker Status ==="
+    echo "Docker Status:"
     if command_exists docker; then
-        if is_wsl && [[ -n "${WINDOWS_DOCKER_PATH:-}" ]]; then
-            echo "Docker Type: Windows Docker.exe via WSL"
-            echo "Docker Path: $WINDOWS_DOCKER_PATH"
-            docker_version_wrapper 2>/dev/null || echo "Docker not accessible"
+        if docker info >/dev/null 2>&1; then
+            echo "  ✓ Docker accessible"
+            docker version --format "  Client: {{.Client.Version}}, Server: {{.Server.Version}}"
         else
-            echo "Docker Type: $(if is_docker_desktop; then echo "Docker Desktop"; else echo "Native Docker"; fi)"
-            docker_version_wrapper 2>/dev/null || echo "Docker not accessible"
+            echo "  ✗ Docker not accessible"
         fi
-        docker_info_wrapper 2>/dev/null | head -20 || echo "Docker daemon not running"
     else
-        echo "Docker not installed"
+        echo "  ✗ Docker not installed"
     fi
     echo
     
-    echo "=== Minikube Status ==="
-    if command_exists minikube; then
-        minikube version
-        minikube status -p "$PROFILE_NAME" 2>/dev/null || echo "No cluster running"
-    else
-        echo "Minikube not installed"
-    fi
-    echo
-    
-    echo "=== kubectl Status ==="
-    if command_exists kubectl; then
-        kubectl version --client 2>/dev/null || echo "kubectl not working"
-        kubectl cluster-info 2>/dev/null || echo "No cluster connection"
-    else
-        echo "kubectl not installed"
-    fi
-    echo
-    
-    echo "=== Network Connectivity ==="
-    echo "Testing connectivity to key endpoints..."
-    local endpoints=(
-        "github.com"
-        "dl.k8s.io"
-        "registry.k8s.io"
-        "gcr.io"
-        "europe-docker.pkg.dev"
-    )
-    
-    for endpoint in "${endpoints[@]}"; do
-        if wget --spider --timeout=5 "https://$endpoint" 2>/dev/null; then
-            echo "✓ $endpoint - reachable"
+    echo "Kubernetes Tools:"
+    for tool in minikube kubectl; do
+        if command_exists "$tool"; then
+            echo "  ✓ $tool installed"
         else
-            echo "✗ $endpoint - unreachable"
+            echo "  ✗ $tool not installed"
         fi
     done
     echo
     
-    echo "=== Proxy Configuration ==="
-    echo "HTTP_PROXY: ${HTTP_PROXY:-not set}"
-    echo "HTTPS_PROXY: ${HTTPS_PROXY:-not set}"
-    echo "NO_PROXY: ${NO_PROXY:-not set}"
+    echo "Network Connectivity:"
+    for endpoint in github.com registry.k8s.io europe-docker.pkg.dev; do
+        if wget --spider --timeout=5 "https://$endpoint" 2>/dev/null; then
+            echo "  ✓ $endpoint reachable"
+        else
+            echo "  ✗ $endpoint unreachable"
+        fi
+    done
     echo
     
-    echo "=== Registry Configuration ==="
-    local registry_config="$CONFIG_DIR/registry.conf"
-    if [[ -f "$registry_config" ]]; then
-        echo "Registry configuration found:"
-        cat "$registry_config"
-    else
-        echo "No registry configuration found"
-    fi
+    echo "Recommended Actions:"
+    echo "1. Ensure Docker Desktop is running on Windows"
+    echo "2. Run: $0 setup-docker (to configure Windows Docker wrapper)"
+    echo "3. Run: $0 fresh-install (for complete setup)"
     echo
-    
-    echo "=== Log File Location ==="
-    echo "Main log: $LOG_FILE"
-    if [[ -f "$LOG_FILE" ]]; then
-        echo "Last 10 log entries:"
-        tail -10 "$LOG_FILE"
-    fi
-    echo
-    
-    echo "=== Recommended Actions ==="
-    echo "1. If Docker is not accessible, run: sudo usermod -aG docker \$USER && newgrp docker"
-    echo "2. If network issues, configure proxy settings or registry mirrors"
-    echo "3. If image pull fails, try: $0 configure-registry"
-    echo "4. For detailed cluster logs, run: minikube logs -p $PROFILE_NAME"
-    echo "5. To completely reset, run: $0 delete && $0 fresh-install"
-    echo "6. For Docker issues in WSL, ensure Docker Desktop WSL integration is enabled"
-    echo "7. If WSL integration error, try: wsl --shutdown && restart Docker Desktop"
-    echo "8. Reset Docker Desktop WSL integration in Settings > Resources > WSL Integration"
 }
 
-# Clean up function for failed installations
-cleanup_failed_install() {
-    log_warning "Cleaning up failed installation..."
+# Fresh installation
+fresh_install() {
+    log_info "Starting fresh installation..."
     
-    # Stop and delete any partial cluster
-    if command_exists minikube; then
-        minikube stop -p "$PROFILE_NAME" 2>/dev/null || true
-        minikube delete -p "$PROFILE_NAME" 2>/dev/null || true
+    if [[ $EUID -eq 0 ]]; then
+        log_error "Do not run as root"
+        exit 1
     fi
     
-    # Clean up any temporary files
-    rm -f minikube-* kubectl-* 2>/dev/null || true
+    if ! is_wsl; then
+        log_error "This script is designed for WSL environments"
+        exit 1
+    fi
     
-    log_info "Cleanup completed"
+    # Setup Windows Docker
+    setup_windows_docker
+    
+    # Install dependencies
+    install_dependencies
+    
+    # Install tools
+    install_minikube
+    install_kubectl
+    
+    # Clean up any existing cluster
+    if command_exists minikube && minikube status -p "$PROFILE_NAME" >/dev/null 2>&1; then
+        log_warning "Removing existing cluster..."
+        minikube delete -p "$PROFILE_NAME"
+    fi
+    
+    # Start new cluster
+    start_minikube
+    
+    log_success "Fresh installation completed!"
 }
 
 # Show help
 show_help() {
     cat << EOF
-Enterprise Kubernetes Local Cluster Management Tool
+Enterprise Kubernetes Local Cluster Management Tool for WSL
 
 USAGE:
     $0 [COMMAND] [OPTIONS]
 
 COMMANDS:
-    fresh-install       Install Docker, Minikube, kubectl, and create a new cluster
-    start              Start the Minikube cluster
-    stop               Stop the Minikube cluster
-    delete             Delete the Minikube cluster
-    status             Show cluster status and information
-    install-docker     Install Docker only (or configure Docker Desktop)
-    configure-registry Configure container registry mirrors and Kubernetes image repository
-    configure-mirror   Configure enterprise mirror for binaries
-    configure-docker-url Configure Docker Desktop connection via URL/TCP
-    fix-docker         Fix Docker service issues
-    troubleshoot       Run diagnostics and show troubleshooting information
-    help               Show this help message
+    fresh-install    Complete installation and cluster setup
+    setup-docker     Setup Windows Docker.exe wrapper for WSL
+    start           Start the Kubernetes cluster
+    stop            Stop the Kubernetes cluster
+    delete          Delete the Kubernetes cluster
+    status          Show cluster status and information
+    troubleshoot    Run diagnostics
+    help            Show this help
 
 OPTIONS:
-    --driver DRIVER         Set the driver (docker, virtualbox, kvm2, etc.) [default: docker]
-    --memory MEMORY         Set memory allocation in MB [default: 4096]
-    --cpus CPUS            Set number of CPUs [default: 2]
-    --disk-size SIZE       Set disk size [default: 50g]
-    --profile NAME         Set profile name [default: enterprise-k8s]
-    --kubectl-version VER  Set specific kubectl version [default: v1.31.1]
-    --image-repository REPO Set custom image repository for Kubernetes components
+    --memory MEMORY     Memory allocation in MB [default: 4096]
+    --cpus CPUS        Number of CPUs [default: 2]
+    --profile NAME     Cluster profile name [default: enterprise-k8s]
 
 EXAMPLES:
-    $0 fresh-install                           # Fresh installation with Docker, Minikube, kubectl
-    $0 fresh-install --memory 8192 --cpus 4   # Fresh install with more resources
-    $0 install-docker                          # Install Docker only (or configure Docker Desktop)
-    $0 setup-windows-docker                   # Setup Windows Docker.exe wrapper (WSL only)
-    $0 start --driver virtualbox              # Start with VirtualBox driver (not recommended in WSL)
-    $0 start --driver docker                  # Start with Docker driver (recommended for WSL/Docker Desktop)
-    $0 status                                  # Show cluster status
-    $0 delete --profile my-cluster            # Delete specific profile
-    $0 configure-registry                      # Configure registry mirrors and Kubernetes image repository
-    $0 start --image-repository europe-docker.pkg.dev/mgmt-bak-bld-1d47/staging/ap/edh/a107595/images/platform-tools/registry.k8s.io # Use custom registry
-
-WSL/DOCKER DESKTOP NOTES:
-    - In WSL with Docker Desktop, ensure WSL 2 integration is enabled
-    - Alternatively, use Windows Docker.exe directly: $0 setup-windows-docker
-    - Go to Docker Desktop > Settings > Resources > WSL Integration
-    - Enable integration with your WSL distribution
-    - Docker daemon configuration is managed through Docker Desktop settings
-    - For insecure registries, configure them in Docker Desktop > Settings > Docker Engine
+    $0 fresh-install                    # Complete setup
+    $0 setup-docker                     # Setup Windows Docker wrapper
+    $0 start --memory 8192 --cpus 4     # Start with more resources
+    $0 status                           # Show cluster status
 
 EOF
 }
@@ -1521,10 +511,6 @@ EOF
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --driver)
-                MINIKUBE_DRIVER="$2"
-                shift 2
-                ;;
             --memory)
                 MINIKUBE_MEMORY="$2"
                 shift 2
@@ -1533,20 +519,8 @@ parse_args() {
                 MINIKUBE_CPUS="$2"
                 shift 2
                 ;;
-            --disk-size)
-                MINIKUBE_DISK_SIZE="$2"
-                shift 2
-                ;;
             --profile)
                 PROFILE_NAME="$2"
-                shift 2
-                ;;
-            --kubectl-version)
-                KUBECTL_VERSION="$2"
-                shift 2
-                ;;
-            --image-repository)
-                IMAGE_REPOSITORY="$2"
                 shift 2
                 ;;
             *)
@@ -1558,61 +532,23 @@ parse_args() {
     done
 }
 
-# Load enterprise mirror configuration
-load_mirror_config() {
-    local mirror_config="$CONFIG_DIR/mirror.conf"
-    if [[ -f "$mirror_config" ]]; then
-        log_info "Loading mirror configuration from $mirror_config"
-        source "$mirror_config"
-    else
-        log_info "No mirror configuration found. Using default settings."
-    fi
-}
-
-# Configure enterprise mirror
-configure_mirror() {
-    log_info "Configuring enterprise mirror..."
-    
-    # Prompt for mirror URL
-    read -p "Enter the enterprise mirror URL (leave empty to skip): " mirror_url
-    
-    if [[ -n "$mirror_url" ]]; then
-        # Save the mirror URL to the config file
-        local mirror_config="$CONFIG_DIR/mirror.conf"
-        echo "# Enterprise mirror configuration - $(date)" > "$mirror_config"
-        echo "ENTERPRISE_MIRROR=\"$mirror_url\"" >> "$mirror_config"
-        
-        log_success "Mirror configuration saved to $mirror_config"
-        
-        # Reload the mirror configuration
-        load_mirror_config
-    else
-        log_info "No mirror URL provided. Skipping mirror configuration."
-    fi
-}
-
-# Main function with enterprise commands
+# Main function
 main() {
-    # Set up error handling
-    trap cleanup_failed_install ERR
-    
     if [[ $# -eq 0 ]]; then
         show_help
         exit 1
     fi
     
-    # Load enterprise mirror configuration
-    load_mirror_config
-    
     local command=$1
     shift
-    
-    # Parse remaining arguments
     parse_args "$@"
     
     case $command in
         fresh-install)
             fresh_install
+            ;;
+        setup-docker)
+            setup_windows_docker
             ;;
         start)
             start_minikube
@@ -1626,17 +562,8 @@ main() {
         status)
             show_cluster_info
             ;;
-        install-minikube)
-            install_minikube
-            ;;
-        install-kubectl)
-            install_kubectl
-            ;;
-        configure-registry)
-            configure_registry_mirrors
-            ;;
-        configure-mirror)
-            configure_mirror
+        troubleshoot)
+            troubleshoot
             ;;
         help|--help|-h)
             show_help
@@ -1649,23 +576,5 @@ main() {
     esac
 }
 
-# Check OS support
-check_os_support() {
-    log_info "Checking OS support..."
-    
-    # Check if running in WSL
-    if is_wsl; then
-        log_info "Running in WSL environment"
-    fi
-    
-    # Check OS type
-    if [[ -f /etc/os-release ]]; then
-        source /etc/os-release
-        log_info "Detected OS: $NAME $VERSION_ID"
-    else
-        log_warning "Could not determine OS type"
-    fi
-}
-
-# Execute main function
+# Run main function
 main "$@"
