@@ -18,13 +18,6 @@ MINIKUBE_DRIVER="docker"
 MINIKUBE_MEMORY="4096"
 MINIKUBE_CPUS="2"
 
-# Image configurations
-KUBE_VERSION="v1.33.1"
-PAUSE_VERSION="3.10"
-ETCD_VERSION="3.5.21-0"
-COREDNS_VERSION="v1.12.0"
-STORAGE_PROVISIONER_VERSION="v5_6e38f40d628d"
-
 # Custom image URLs (set these to your custom registries if needed)
 CUSTOM_PAUSE_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/registry.k8s.io/pause:3.10"
 CUSTOM_APISERVER_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/registry.k8s.io/kube-apiserver:v1.33.1"
@@ -91,13 +84,13 @@ extract_repo() {
 pull_and_tag_images() {
     log_info "=== STEP 1: PULLING AND TAGGING IMAGES ==="
     
-    # Extract actual tags from custom images or use defaults
-    local pause_tag="${PAUSE_VERSION}"
-    local kube_tag="${KUBE_VERSION}"
-    local etcd_tag="${ETCD_VERSION}"
-    local coredns_tag="${COREDNS_VERSION}"
-    local storage_tag="${STORAGE_PROVISIONER_VERSION}"
-    local kicbase_tag="v0.0.47"
+    # Extract actual tags from custom images or use sensible defaults
+    local pause_tag="3.9"
+    local kube_tag="v1.31.1"
+    local etcd_tag="3.5.15-0"
+    local coredns_tag="v1.11.1"
+    local storage_tag="v5"
+    local kicbase_tag="v0.0.44"
     
     log_info "=== TAG EXTRACTION DEBUG ==="
     if [[ -n "$CUSTOM_PAUSE_IMAGE" ]]; then
@@ -227,13 +220,13 @@ load_images_into_minikube() {
         return 1
     fi
     
-    # Extract actual tags from custom images or use defaults
-    local pause_tag="${PAUSE_VERSION}"
-    local kube_tag="${KUBE_VERSION}"
-    local etcd_tag="${ETCD_VERSION}"
-    local coredns_tag="${COREDNS_VERSION}"
-    local storage_tag="${STORAGE_PROVISIONER_VERSION}"
-    local kicbase_tag="v0.0.47"
+    # Extract actual tags from custom images or use sensible defaults
+    local pause_tag="3.9"
+    local kube_tag="v1.31.1"
+    local etcd_tag="3.5.15-0"
+    local coredns_tag="v1.11.1"
+    local storage_tag="v5"
+    local kicbase_tag="v0.0.44"
     
     if [[ -n "$CUSTOM_PAUSE_IMAGE" ]]; then
         pause_tag=$(extract_tag "$CUSTOM_PAUSE_IMAGE")
