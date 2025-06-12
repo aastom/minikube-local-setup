@@ -47,7 +47,7 @@ install_dependencies() {
     local packages=(
         apt-transport-https
         ca-certificates
-        curl
+        wget
         gnupg
         lsb-release
         software-properties-common
@@ -55,6 +55,7 @@ install_dependencies() {
         dbus-user-session
         fuse-overlayfs
         slirp4netns
+        git
     )
     
     sudo apt-get install -y "${packages[@]}"
@@ -71,7 +72,7 @@ add_docker_repo() {
     
     # Add Docker's official GPG key
     sudo mkdir -p /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    wget --no-check-certificate -qO- https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     
     # Add Docker repository
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
@@ -271,29 +272,121 @@ test_docker() {
     log_success "Docker installation test completed successfully!"
 }
 
-# Install Docker Compose (standalone)
-install_docker_compose() {
-    log_info "Installing Docker Compose..."
+# Install minikube using git
+install_minikube() {
+    log_info "Installing minikube from source..."
     
-    # Get latest version
-    local compose_version=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep 'tag_name' | cut -d\" -f4)
+    # Create temporary directory
+    local temp_dir="/tmp/minikube-install"
+    rm -rf "$temp_dir"
+    mkdir -p "$temp_dir"
+    cd "$temp_dir"
     
-    # Download and install
-    sudo curl -L "https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-    sudo chmod +x /usr/local/bin/docker-compose
+    # Clone minikube repository
+    log_info "Cloning minikube repository..."
+    git clone https://github.com/kubernetes/minikube.git
+    cd minikube
     
-    # Create symlink
-    sudo ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+    # Get the latest release tag
+    local latest_tag=$(git describe --tags --abbrev=0)
+    log_info "Latest minikube version: $latest_tag"
     
-    log_success "Docker Compose ${compose_version} installed successfully"
+    # Checkout the latest release
+    git checkout "$latest_tag"
+    
+    # Determine architecture
+    local arch
+    case "$(uname -m)" in
+        x86_64) arch="amd64" ;;
+        arm64|aarch64) arch="arm64" ;;
+        *) log_error "Unsupported architecture: $(uname -m)"; return 1 ;;
+    esac
+    
+    # Download the pre-built binary for the release
+    log_info "Downloading minikube binary for $arch..."
+    local binary_url="https://github.com/kubernetes/minikube/releases/download/${latest_tag}/minikube-linux-${arch}"
+    
+    if wget --no-check-certificate -O minikube-binary "$binary_url"; then
+        log_success "Downloaded minikube binary"
+        
+        # Install the binary
+        chmod +x minikube-binary
+        sudo mv minikube-binary /usr/local/bin/minikube
+        
+        # Verify installation
+        if minikube version; then
+            log_success "Minikube installed successfully: $(/usr/local/bin/minikube version --short)"
+        else
+            log_error "Minikube installation verification failed"
+            return 1
+        fi
+    else
+        log_error "Failed to download minikube binary"
+        return 1
+    fi
+    
+    # Clean up
+    cd /
+    rm -rf "$temp_dir"
+    
+    log_success "Minikube installation completed"
+}
+
+# Install kubectl using wget
+install_kubectl() {
+    log_info "Installing kubectl..."
+    
+    # Get latest stable version
+    local kubectl_version
+    if kubectl_version=$(wget --no-check-certificate -qO- "https://dl.k8s.io/release/stable.txt" 2>/dev/null); then
+        log_info "Latest kubectl version: $kubectl_version"
+    else
+        kubectl_version="v1.31.1"
+        log_warning "Could not get latest version, using fallback: $kubectl_version"
+    fi
+    
+    # Determine architecture
+    local arch
+    case "$(uname -m)" in
+        x86_64) arch="amd64" ;;
+        arm64|aarch64) arch="arm64" ;;
+        *) log_error "Unsupported architecture: $(uname -m)"; return 1 ;;
+    esac
+    
+    # Download kubectl
+    local kubectl_url="https://dl.k8s.io/release/${kubectl_version}/bin/linux/${arch}/kubectl"
+    
+    if wget --no-check-certificate -O /tmp/kubectl "$kubectl_url"; then
+        log_success "Downloaded kubectl"
+        
+        # Install kubectl
+        chmod +x /tmp/kubectl
+        sudo mv /tmp/kubectl /usr/local/bin/kubectl
+        
+        # Verify installation
+        if kubectl version --client; then
+            log_success "kubectl installed successfully"
+        else
+            log_error "kubectl installation verification failed"
+            return 1
+        fi
+    else
+        log_error "Failed to download kubectl"
+        return 1
+    fi
 }
 
 # Show usage instructions
 show_usage() {
+    echo "========================================"
+    log_success "Docker, minikube, and kubectl installation completed!"
+    echo "========================================"
     echo
-    echo "========================================"
-    log_success "Docker installation completed!"
-    echo "========================================"
+    log_info "Installed Components:"
+    echo "  - Docker Engine with WSL optimizations"
+    echo "  - Docker Compose"
+    echo "  - Minikube (latest release from GitHub)"
+    echo "  - kubectl (latest stable)"
     echo
     log_info "Docker Service Management:"
     echo "  /usr/local/bin/docker-service start    # Start Docker"
@@ -304,6 +397,8 @@ show_usage() {
     log_info "Quick Commands:"
     echo "  docker-service start    # Start Docker"
     echo "  docker --version        # Check Docker version"
+    echo "  minikube version         # Check minikube version"
+    echo "  kubectl version --client # Check kubectl version"
     echo "  docker run hello-world  # Test Docker"
     echo
     log_warning "Important Notes:"
@@ -315,6 +410,8 @@ show_usage() {
     log_info "To start Docker now, run:"
     echo "  newgrp docker"
     echo "  docker-service start"
+    echo
+    log_info "Then you can use the minikube script for Kubernetes setup!"
     echo
 }
 
@@ -338,7 +435,44 @@ main() {
     configure_docker_wsl
     create_docker_service_script
     create_autostart_script
-    install_docker_compose
+# Install Docker Compose (standalone)
+install_docker_compose() {
+    log_info "Installing Docker Compose..."
+    
+    # Get latest version using wget
+    local compose_version
+    if compose_version=$(wget --no-check-certificate -qO- https://api.github.com/repos/docker/compose/releases/latest 2>/dev/null | grep 'tag_name' | cut -d\" -f4); then
+        log_info "Latest Docker Compose version: $compose_version"
+    else
+        compose_version="v2.24.0"
+        log_warning "Could not get latest version, using fallback: $compose_version"
+    fi
+    
+    # Download and install
+    local compose_url="https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-$(uname -s)-$(uname -m)"
+    
+    if wget --no-check-certificate -O /tmp/docker-compose "$compose_url"; then
+        log_success "Downloaded Docker Compose"
+        
+        # Install
+        sudo mv /tmp/docker-compose /usr/local/bin/docker-compose
+        sudo chmod +x /usr/local/bin/docker-compose
+        
+        # Create symlink
+        sudo ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+        
+        # Verify installation
+        if docker-compose --version; then
+            log_success "Docker Compose installed successfully"
+        else
+            log_error "Docker Compose installation verification failed"
+            return 1
+        fi
+    else
+        log_error "Failed to download Docker Compose"
+        return 1
+    fi
+}
     
     # Test installation (in new group context)
     log_info "Testing Docker installation..."
