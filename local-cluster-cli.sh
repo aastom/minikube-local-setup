@@ -444,10 +444,11 @@ start_minikube() {
         log_info "Using custom etcd image: $ETCD_IMAGE"
     fi
     
-    # Add custom storage-provisioner image
+    # Note: storage-provisioner image is controlled via different mechanism
+    # It's handled by minikube addons, not via extra-config
     if [[ -n "$STORAGE_PROVISIONER_IMAGE" ]]; then
-        start_cmd+=" --extra-config=storage-provisioner.image=\"$STORAGE_PROVISIONER_IMAGE\""
-        log_info "Using custom storage-provisioner image: $STORAGE_PROVISIONER_IMAGE"
+        log_info "Custom storage-provisioner image specified: $STORAGE_PROVISIONER_IMAGE"
+        log_info "Will configure storage-provisioner after cluster starts"
     fi
     
     # Start cluster with retry logic
@@ -494,6 +495,35 @@ start_minikube() {
             log_warning "Failed to enable $addon addon"
         fi
     done
+    
+    # Configure storage-provisioner with custom image if specified
+    if [[ -n "$STORAGE_PROVISIONER_IMAGE" ]]; then
+        log_info "Configuring custom storage-provisioner image..."
+        
+        # Enable storage-provisioner addon first
+        if minikube addons enable storage-provisioner -p "$PROFILE_NAME" 2>/dev/null; then
+            log_success "Enabled storage-provisioner addon"
+            
+            # Wait a moment for the addon to be ready
+            sleep 5
+            
+            # Update the storage-provisioner deployment with custom image
+            if kubectl patch deployment storage-provisioner -n kube-system -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"storage-provisioner\",\"image\":\"$STORAGE_PROVISIONER_IMAGE\"}]}}}}" 2>/dev/null; then
+                log_success "Updated storage-provisioner to use custom image: $STORAGE_PROVISIONER_IMAGE"
+            else
+                log_warning "Failed to update storage-provisioner image, using default"
+            fi
+        else
+            log_warning "Failed to enable storage-provisioner addon"
+        fi
+    else
+        # Enable default storage-provisioner
+        if minikube addons enable storage-provisioner -p "$PROFILE_NAME" 2>/dev/null; then
+            log_success "Enabled storage-provisioner addon"
+        else
+            log_warning "Failed to enable storage-provisioner addon"
+        fi
+    fi
     
     show_cluster_info
 }
