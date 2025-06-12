@@ -20,7 +20,7 @@ MINIKUBE_DRIVER="docker"
 KUBECTL_VERSION="v1.31.1"
 PROFILE_NAME="enterprise-k8s"
 INSECURE_REGISTRIES="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,europe-docker.pkg.dev"
-IMAGE_REPOSITORY="europe-docker.pkg.dev/mgmt-bak-bld-1d47/staging/ap/edh/a107595/images/platform-tools/registry.k8s.io"
+IMAGE_REPOSITORY="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/a107595/images/platform-tools/registry.k8s.io"
 CONFIG_DIR="$HOME/.local-cluster-cli"
 LOG_FILE="$CONFIG_DIR/cluster.log"
 
