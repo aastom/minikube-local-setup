@@ -63,6 +63,96 @@ is_wsl() {
     [[ -n "${WSL_DISTRO_NAME:-}" ]] || [[ -n "${WSL_INTEROP:-}" ]] || [[ -f /proc/sys/fs/binfmt_misc/WSLInterop ]] || grep -qi microsoft /proc/version 2>/dev/null
 }
 
+# Load custom image configuration
+load_image_config() {
+    local image_config="$CONFIG_DIR/images.conf"
+    if [[ -f "$image_config" ]]; then
+        log_info "Loading custom image configuration from $image_config"
+        source "$image_config"
+        
+        # Log which custom images are being used
+        [[ -n "$KICBASE_IMAGE" ]] && log_info "Custom kicbase: $KICBASE_IMAGE"
+        [[ -n "$PAUSE_IMAGE" ]] && log_info "Custom pause: $PAUSE_IMAGE"
+        [[ -n "$KUBE_APISERVER_IMAGE" ]] && log_info "Custom apiserver: $KUBE_APISERVER_IMAGE"
+        [[ -n "$KUBE_CONTROLLER_MANAGER_IMAGE" ]] && log_info "Custom controller-manager: $KUBE_CONTROLLER_MANAGER_IMAGE"
+        [[ -n "$KUBE_SCHEDULER_IMAGE" ]] && log_info "Custom scheduler: $KUBE_SCHEDULER_IMAGE"
+        [[ -n "$KUBE_PROXY_IMAGE" ]] && log_info "Custom proxy: $KUBE_PROXY_IMAGE"
+        [[ -n "$ETCD_IMAGE" ]] && log_info "Custom etcd: $ETCD_IMAGE"
+        [[ -n "$COREDNS_IMAGE" ]] && log_info "Custom coredns: $COREDNS_IMAGE"
+        [[ -n "$STORAGE_PROVISIONER_IMAGE" ]] && log_info "Custom storage-provisioner: $STORAGE_PROVISIONER_IMAGE"
+    else
+        log_info "No custom image configuration found, using defaults"
+    fi
+}
+
+# Configure individual image URLs
+configure_images() {
+    log_info "Configuring individual image URLs..."
+    echo "Leave empty to use default. Current base repository: $IMAGE_REPOSITORY"
+    echo
+    
+    read -p "kicbase image URL (for minikube VM): " KICBASE_IMAGE
+    read -p "pause image URL: " PAUSE_IMAGE
+    read -p "kube-apiserver image URL: " KUBE_APISERVER_IMAGE
+    read -p "kube-controller-manager image URL: " KUBE_CONTROLLER_MANAGER_IMAGE
+    read -p "kube-scheduler image URL: " KUBE_SCHEDULER_IMAGE
+    read -p "kube-proxy image URL: " KUBE_PROXY_IMAGE
+    read -p "etcd image URL: " ETCD_IMAGE
+    read -p "coredns image URL: " COREDNS_IMAGE
+    read -p "storage-provisioner image URL: " STORAGE_PROVISIONER_IMAGE
+    
+    # Save configuration
+    local image_config="$CONFIG_DIR/images.conf"
+    cat > "$image_config" << EOF
+# Custom image configuration - $(date)
+# Leave values empty to use defaults
+
+# Minikube base image (for the VM itself)
+KICBASE_IMAGE="$KICBASE_IMAGE"
+
+# Kubernetes component images
+PAUSE_IMAGE="$PAUSE_IMAGE"
+KUBE_APISERVER_IMAGE="$KUBE_APISERVER_IMAGE"
+KUBE_CONTROLLER_MANAGER_IMAGE="$KUBE_CONTROLLER_MANAGER_IMAGE"
+KUBE_SCHEDULER_IMAGE="$KUBE_SCHEDULER_IMAGE"
+KUBE_PROXY_IMAGE="$KUBE_PROXY_IMAGE"
+ETCD_IMAGE="$ETCD_IMAGE"
+COREDNS_IMAGE="$COREDNS_IMAGE"
+STORAGE_PROVISIONER_IMAGE="$STORAGE_PROVISIONER_IMAGE"
+
+# Default versions (used when custom URLs are not specified)
+PAUSE_VERSION="$PAUSE_VERSION"
+KUBE_VERSION="$KUBE_VERSION"
+ETCD_VERSION="$ETCD_VERSION"
+COREDNS_VERSION="$COREDNS_VERSION"
+STORAGE_PROVISIONER_VERSION="$STORAGE_PROVISIONER_VERSION"
+EOF
+    
+    log_success "Image configuration saved to $image_config"
+    log_info "You can edit this file directly or run 'configure-images' again to modify"
+}
+
+# Get image URL with fallback logic
+get_image_url() {
+    local component=$1
+    local custom_var="$2"
+    local default_name="$3"
+    local version="$4"
+    
+    # If custom URL is provided, use it
+    if [[ -n "$custom_var" ]]; then
+        echo "$custom_var"
+        return 0
+    fi
+    
+    # Otherwise construct from base repository
+    if [[ -n "$IMAGE_REPOSITORY" ]]; then
+        echo "${IMAGE_REPOSITORY}/${default_name}:${version}"
+    else
+        echo "registry.k8s.io/${default_name}:${version}"
+    fi
+}
+
 # Find Windows Docker executable
 find_windows_docker() {
     local docker_paths=(
