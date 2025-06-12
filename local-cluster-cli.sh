@@ -546,19 +546,113 @@ pre_pull_and_tag_images() {
     return 0
 }
 
-# Save image manifest to prevent remote pulls
-save_image_manifest() {
-    local manifest_file="$CONFIG_DIR/image-manifest.txt"
-    log_info "Saving local image manifest to $manifest_file"
+# Load images into minikube's Docker daemon
+load_images_into_minikube() {
+    log_info "Loading images into minikube's Docker daemon..."
     
-    # List all locally available Kubernetes images
-    docker images --format "table {{.Repository}}:{{.Tag}}" | grep -E "(registry\.k8s\.io|gcr\.io|k8s\.gcr\.io)" > "$manifest_file" 2>/dev/null || true
+    if ! command_exists minikube; then
+        log_error "Minikube is not installed"
+        return 1
+    fi
     
-    if [[ -s "$manifest_file" ]]; then
-        log_success "Image manifest saved with $(wc -l < "$manifest_file") images"
-        log_info "Local images will be preferred during cluster start"
+    # Check if cluster is running
+    if ! minikube status -p "$PROFILE_NAME" 2>/dev/null | grep -q "Running"; then
+        log_error "Minikube cluster is not running"
+        return 1
+    fi
+    
+    # Define images that should be loaded into minikube
+    local images_to_load=(
+        "registry.k8s.io/pause:${PAUSE_VERSION}"
+        "registry.k8s.io/kube-apiserver:${KUBE_VERSION}"
+        "registry.k8s.io/kube-controller-manager:${KUBE_VERSION}"
+        "registry.k8s.io/kube-scheduler:${KUBE_VERSION}"
+        "registry.k8s.io/kube-proxy:${KUBE_VERSION}"
+        "registry.k8s.io/etcd:${ETCD_VERSION}"
+        "registry.k8s.io/coredns/coredns:${COREDNS_VERSION}"
+        "gcr.io/k8s-minikube/storage-provisioner:${STORAGE_PROVISIONER_VERSION}"
+    )
+    
+    # Also load kicbase if we pulled a custom one
+    if [[ -n "$KICBASE_IMAGE" ]]; then
+        images_to_load+=("$KICBASE_IMAGE")
+    fi
+    
+    local loaded_count=0
+    local failed_count=0
+    local total_images=${#images_to_load[@]}
+    
+    for image in "${images_to_load[@]}"; do
+        log_info "Loading image into minikube: $image"
+        
+        # Check if image exists locally first
+        if ! docker image inspect "$image" >/dev/null 2>&1; then
+            log_warning "Image not found locally, skipping: $image"
+            ((failed_count++))
+            continue
+        fi
+        
+        # Load image into minikube
+        if minikube image load "$image" -p "$PROFILE_NAME" 2>/dev/null; then
+            log_success "Successfully loaded: $image"
+            ((loaded_count++))
+        else
+            log_warning "Failed to load: $image"
+            ((failed_count++))
+        fi
+    done
+    
+    echo "========================================"
+    log_info "Image loading summary:"
+    log_info "  Total images: $total_images"
+    log_info "  Successfully loaded: $loaded_count"
+    log_info "  Failed/Skipped: $failed_count"
+    echo "========================================"
+    
+    if [[ $loaded_count -gt 0 ]]; then
+        log_success "Images loaded into minikube successfully!"
+        
+        # Verify images are available in minikube
+        log_info "Verifying images in minikube..."
+        minikube ssh -p "$PROFILE_NAME" -- "docker images --format 'table {{.Repository}}:{{.Tag}}' | grep -E '(registry\.k8s\.io|gcr\.io)'" 2>/dev/null || true
+    fi
+    
+    return 0
+}
+
+# Alternative method: Use minikube's Docker daemon directly
+use_minikube_docker_daemon() {
+    log_info "Configuring to use minikube's Docker daemon..."
+    
+    if ! command_exists minikube; then
+        log_error "Minikube is not installed"
+        return 1
+    fi
+    
+    # Check if cluster is running
+    if ! minikube status -p "$PROFILE_NAME" 2>/dev/null | grep -q "Running"; then
+        log_error "Minikube cluster is not running"
+        return 1
+    fi
+    
+    # Get minikube docker-env
+    log_info "Switching to minikube's Docker daemon..."
+    
+    # Export minikube docker environment
+    eval $(minikube docker-env -p "$PROFILE_NAME")
+    
+    if [[ -n "${DOCKER_HOST:-}" ]]; then
+        log_success "Successfully switched to minikube's Docker daemon"
+        log_info "Docker host: ${DOCKER_HOST}"
+        
+        # Now pull/tag images directly in minikube's Docker daemon
+        log_info "Pulling images directly into minikube's Docker daemon..."
+        pre_pull_and_tag_images
+        
+        return 0
     else
-        log_warning "No Kubernetes images found locally"
+        log_error "Failed to switch to minikube's Docker daemon"
+        return 1
     fi
 }
 
@@ -611,12 +705,25 @@ start_minikube() {
         log_info "Docker is accessible, processing images..."
         configure_minikube_local_images
         
-        # Only do image pre-pull if we have custom images or this is a fresh install
-        if [[ -n "$KICBASE_IMAGE$PAUSE_IMAGE$KUBE_APISERVER_IMAGE$KUBE_CONTROLLER_MANAGER_IMAGE$KUBE_SCHEDULER_IMAGE$KUBE_PROXY_IMAGE$ETCD_IMAGE$COREDNS_IMAGE$STORAGE_PROVISIONER_IMAGE" ]] || [[ ! -f "$CONFIG_DIR/image-manifest.txt" ]]; then
-            pre_pull_and_tag_images
+        # For Docker driver, we'll load images after cluster starts
+        if [[ "$MINIKUBE_DRIVER" == "docker" ]]; then
+            log_info "Docker driver detected - images will be loaded after cluster starts"
+            
+            # Only pre-pull if we have custom images or this is a fresh install
+            if [[ -n "$KICBASE_IMAGE$PAUSE_IMAGE$KUBE_APISERVER_IMAGE$KUBE_CONTROLLER_MANAGER_IMAGE$KUBE_SCHEDULER_IMAGE$KUBE_PROXY_IMAGE$ETCD_IMAGE$COREDNS_IMAGE$STORAGE_PROVISIONER_IMAGE" ]] || [[ ! -f "$CONFIG_DIR/image-manifest.txt" ]]; then
+                log_info "Pre-pulling images to host Docker daemon..."
+                pre_pull_and_tag_images
+            else
+                log_info "Using existing image cache, skipping pre-pull"
+            fi
         else
-            log_info "Using existing image cache, skipping pre-pull"
-            log_info "Use 'clean-images' command to force re-download"
+            # For other drivers, pre-pull and tag as before
+            if [[ -n "$KICBASE_IMAGE$PAUSE_IMAGE$KUBE_APISERVER_IMAGE$KUBE_CONTROLLER_MANAGER_IMAGE$KUBE_SCHEDULER_IMAGE$KUBE_PROXY_IMAGE$ETCD_IMAGE$COREDNS_IMAGE$STORAGE_PROVISIONER_IMAGE" ]] || [[ ! -f "$CONFIG_DIR/image-manifest.txt" ]]; then
+                pre_pull_and_tag_images
+            else
+                log_info "Using existing image cache, skipping pre-pull"
+                log_info "Use 'clean-images' command to force re-download"
+            fi
         fi
     else
         log_warning "Docker not accessible, skipping image pre-pull"
@@ -791,9 +898,33 @@ start_minikube() {
     show_cluster_info
 }
 
+# Save image manifest to prevent remote pulls
+save_image_manifest() {
+    local manifest_file="$CONFIG_DIR/image-manifest.txt"
+    log_info "Saving local image manifest to $manifest_file"
+    
+    # List all locally available Kubernetes images
+    docker images --format "table {{.Repository}}:{{.Tag}}" | grep -E "(registry\.k8s\.io|gcr\.io|k8s\.gcr\.io)" > "$manifest_file" 2>/dev/null || true
+    
+    if [[ -s "$manifest_file" ]]; then
+        log_success "Image manifest saved with $(wc -l < "$manifest_file") images"
+        log_info "Local images will be preferred during cluster start"
+    else
+        log_warning "No Kubernetes images found locally"
+    fi
+}
+
 # Configure components that need post-startup configuration
 configure_post_startup_components() {
     log_info "Configuring post-startup components..."
+    
+    # Load images into minikube's Docker daemon if using Docker driver
+    if [[ "$MINIKUBE_DRIVER" == "docker" ]]; then
+        echo "========================================"
+        log_info "Loading images into minikube's Docker daemon..."
+        echo "========================================"
+        load_images_into_minikube
+    fi
     
     # Enable essential addons
     log_info "Enabling addons..."
@@ -1144,6 +1275,7 @@ COMMANDS:
     status          Show cluster status and information
     troubleshoot    Run diagnostics
     clean-images    Remove local Kubernetes images
+    load-images     Load locally pulled images into running minikube cluster
     help            Show this help
 
 OPTIONS:
@@ -1300,7 +1432,7 @@ main() {
     
     # Validate command before processing
     case $command in
-        fresh-install|setup-docker|configure-images|start|stop|delete|status|troubleshoot|clean-images|help|--help|-h)
+        fresh-install|setup-docker|configure-images|start|stop|delete|status|troubleshoot|clean-images|load-images|help|--help|-h)
             # Valid command, continue
             ;;
         *)
@@ -1348,6 +1480,10 @@ main() {
             ;;
         clean-images)
             clean_images
+            ;;
+        load-images)
+            load_image_config
+            load_images_into_minikube
             ;;
         help|--help|-h)
             show_help
