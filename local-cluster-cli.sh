@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Simple Minikube Image Management Script
-# Does exactly what you want: pull images, tag them, load into minikube, start cluster
+# Ubuntu Docker Setup for WSL (No Windows Docker Desktop)
+# This script installs Docker directly on Ubuntu WSL without using Windows Docker Desktop
 
 set -e
 
@@ -12,451 +12,382 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# Configuration
-PROFILE_NAME="enterprise-k8s"
-MINIKUBE_DRIVER="docker"
-MINIKUBE_MEMORY="4096"
-MINIKUBE_CPUS="2"
+# Logging functions (define these first)
+log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-# Custom image URLs (set these to your custom registries if needed)
-CUSTOM_PAUSE_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/registry.k8s.io/pause:3.10"
-CUSTOM_APISERVER_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/registry.k8s.io/kube-apiserver:v1.33.1"
-CUSTOM_CONTROLLER_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/registry.k8s.io/kube-controller-manager:v1.33.1"
-CUSTOM_SCHEDULER_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/registry.k8s.io/kube-scheduler:v1.33.1"
-CUSTOM_PROXY_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/registry.k8s.io/kube-proxy:v1.33.1"
-CUSTOM_ETCD_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/registry.k8s.io/etcd:3.5.21-0"
-CUSTOM_COREDNS_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/registry.k8s.io/coredns/coredns:v1.12.0"
-CUSTOM_STORAGE_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/gcr.io/k8s-minikube/storage-provisioner:v5_6e38f40d628d"
-CUSTOM_KICBASE_IMAGE="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/al07595/images/platform-tools/gcr.io/k8s-minikube/kicbase:v0.0.47"
-
-# Check if Docker is running and start if needed
-ensure_docker_running() {
-    log_info "Checking Docker status..."
-    
-    if docker info >/dev/null 2>&1; then
-        log_success "Docker is already running"
-        return 0
-    fi
-    
-    log_info "Docker is not running, attempting to start..."
-    
-    # Try to start Docker using the service script
-    if command -v docker-service >/dev/null 2>&1; then
-        if docker-service start; then
-            log_success "Docker started successfully"
-            return 0
-        fi
-    fi
-    
-    # Fallback: try to start dockerd directly
-    log_info "Trying to start Docker daemon directly..."
-    if sudo dockerd >/dev/null 2>&1 & then
-        # Wait for Docker to start
-        local count=0
-        while ! docker info >/dev/null 2>&1; do
-            sleep 1
-            count=$((count + 1))
-            if [ $count -gt 30 ]; then
-                log_error "Docker failed to start within 30 seconds"
-                return 1
-            fi
-        done
-        log_success "Docker started successfully"
-        return 0
-    fi
-    
-    log_error "Failed to start Docker"
-    log_info "Please ensure Docker is installed and you have the necessary permissions"
-    log_info "Try running: sudo apt install docker.io && sudo usermod -aG docker \$USER"
-    return 1
+# Check if running in WSL
+is_wsl() {
+    [[ -n "${WSL_DISTRO_NAME:-}" ]] || [[ -n "${WSL_INTEROP:-}" ]] || [[ -f /proc/sys/fs/binfmt_misc/WSLInterop ]] || grep -qi microsoft /proc/version 2>/dev/null
 }
 
-# Function to extract tag from image URL (handles complex URLs with multiple colons)
-extract_tag() {
-    local image_url="$1"
-    
-    # Debug: show what we're parsing
-    log_info "  Parsing URL: $image_url"
-    
-    # For your specific URL format: europe-docker.pkg.dev/.../registry.k8s.io/component:tag
-    # The tag is after the last colon, but we need to be careful about registry URLs
-    
-    # Look for pattern: /component:tag at the very end
-    if [[ "$image_url" =~ /([^/]+):([^/:]+)$ ]]; then
-        local component="${BASH_REMATCH[1]}"
-        local tag="${BASH_REMATCH[2]}"
-        log_info "  Found component: $component, tag: $tag"
-        echo "$tag"
-        return 0
-    fi
-    
-    # Fallback: split by colon and take the last part if it doesn't contain slashes
-    local last_colon_part="${image_url##*:}"
-    if [[ "$last_colon_part" != *"/"* ]]; then
-        log_info "  Extracted tag (fallback): $last_colon_part"
-        echo "$last_colon_part"
-        return 0
-    fi
-    
-    # If we get here, something's wrong with the URL format
-    log_warning "  Could not extract tag from: $image_url"
-    log_warning "  Using 'latest' as fallback"
-    echo "latest"
-}
-
-# Function to extract repository path from image URL (everything before the last colon that's a tag)
-extract_repo() {
-    local image_url="$1"
-    local tag=$(extract_tag "$image_url")
-    
-    # If tag is "latest" and not explicitly in URL, return the full URL
-    if [[ "$tag" == "latest" && "$image_url" != *":latest" ]]; then
-        echo "$image_url"
-    else
-        echo "${image_url%:$tag}"
+# Check if running as root
+check_not_root() {
+    if [[ $EUID -eq 0 ]]; then
+        log_error "This script should not be run as root"
+        log_info "Run as your regular user (the script will use sudo when needed)"
+        exit 1
     fi
 }
 
-# Function to pull and tag images
-pull_and_tag_images() {
-    log_info "=== STEP 1: PULLING AND TAGGING IMAGES ==="
+# Update system packages
+update_system() {
+    log_info "Updating system packages..."
+    sudo apt-get update -qq
+    sudo apt-get upgrade -y
+    log_success "System updated successfully"
+}
+
+# Install required dependencies
+install_dependencies() {
+    log_info "Installing required dependencies..."
     
-    # Ensure Docker is running
-    if ! ensure_docker_running; then
-        log_error "Cannot proceed without Docker"
-        return 1
-    fi
-    
-    # Extract actual tags from custom images or use sensible defaults
-    local pause_tag="3.9"
-    local kube_tag="v1.31.1"
-    local etcd_tag="3.5.15-0"
-    local coredns_tag="v1.11.1"
-    local storage_tag="v5"
-    local kicbase_tag="v0.0.44"
-    
-    log_info "=== TAG EXTRACTION DEBUG ==="
-    if [[ -n "$CUSTOM_PAUSE_IMAGE" ]]; then
-        log_info "CUSTOM_PAUSE_IMAGE: $CUSTOM_PAUSE_IMAGE"
-        pause_tag=$(extract_tag "$CUSTOM_PAUSE_IMAGE")
-    fi
-    if [[ -n "$CUSTOM_APISERVER_IMAGE" ]]; then
-        log_info "CUSTOM_APISERVER_IMAGE: $CUSTOM_APISERVER_IMAGE"
-        kube_tag=$(extract_tag "$CUSTOM_APISERVER_IMAGE")
-    fi
-    if [[ -n "$CUSTOM_ETCD_IMAGE" ]]; then
-        log_info "CUSTOM_ETCD_IMAGE: $CUSTOM_ETCD_IMAGE"
-        etcd_tag=$(extract_tag "$CUSTOM_ETCD_IMAGE")
-    fi
-    if [[ -n "$CUSTOM_COREDNS_IMAGE" ]]; then
-        log_info "CUSTOM_COREDNS_IMAGE: $CUSTOM_COREDNS_IMAGE"
-        coredns_tag=$(extract_tag "$CUSTOM_COREDNS_IMAGE")
-    fi
-    if [[ -n "$CUSTOM_STORAGE_IMAGE" ]]; then
-        log_info "CUSTOM_STORAGE_IMAGE: $CUSTOM_STORAGE_IMAGE"
-        storage_tag=$(extract_tag "$CUSTOM_STORAGE_IMAGE")
-    fi
-    if [[ -n "$CUSTOM_KICBASE_IMAGE" ]]; then
-        log_info "CUSTOM_KICBASE_IMAGE: $CUSTOM_KICBASE_IMAGE"
-        kicbase_tag=$(extract_tag "$CUSTOM_KICBASE_IMAGE")
-    fi
-    log_info "=== END DEBUG ==="
-    echo
-    
-    log_info "Extracted tags:"
-    log_info "  pause: $pause_tag"
-    log_info "  kube components: $kube_tag"
-    log_info "  etcd: $etcd_tag"
-    log_info "  coredns: $coredns_tag"
-    log_info "  storage: $storage_tag"
-    log_info "  kicbase: $kicbase_tag"
-    echo
-    
-    # Define image mappings using extracted tags
-    declare -A images=(
-        ["pause"]="${CUSTOM_PAUSE_IMAGE:-registry.k8s.io/pause:$pause_tag}:registry.k8s.io/pause:$pause_tag"
-        ["apiserver"]="${CUSTOM_APISERVER_IMAGE:-registry.k8s.io/kube-apiserver:$kube_tag}:registry.k8s.io/kube-apiserver:$kube_tag"
-        ["controller"]="${CUSTOM_CONTROLLER_IMAGE:-registry.k8s.io/kube-controller-manager:$kube_tag}:registry.k8s.io/kube-controller-manager:$kube_tag"
-        ["scheduler"]="${CUSTOM_SCHEDULER_IMAGE:-registry.k8s.io/kube-scheduler:$kube_tag}:registry.k8s.io/kube-scheduler:$kube_tag"
-        ["proxy"]="${CUSTOM_PROXY_IMAGE:-registry.k8s.io/kube-proxy:$kube_tag}:registry.k8s.io/kube-proxy:$kube_tag"
-        ["etcd"]="${CUSTOM_ETCD_IMAGE:-registry.k8s.io/etcd:$etcd_tag}:registry.k8s.io/etcd:$etcd_tag"
-        ["coredns"]="${CUSTOM_COREDNS_IMAGE:-registry.k8s.io/coredns/coredns:$coredns_tag}:registry.k8s.io/coredns/coredns:$coredns_tag"
-        ["storage"]="${CUSTOM_STORAGE_IMAGE:-gcr.io/k8s-minikube/storage-provisioner:$storage_tag}:gcr.io/k8s-minikube/storage-provisioner:$storage_tag"
-        ["kicbase"]="${CUSTOM_KICBASE_IMAGE:-gcr.io/k8s-minikube/kicbase:$kicbase_tag}:gcr.io/k8s-minikube/kicbase:$kicbase_tag"
+    local packages=(
+        apt-transport-https
+        ca-certificates
+        curl
+        gnupg
+        lsb-release
+        software-properties-common
+        uidmap
+        dbus-user-session
+        fuse-overlayfs
+        slirp4netns
     )
     
-    for component in "${!images[@]}"; do
-        IFS=':' read -r source_image minikube_tag <<< "${images[$component]}"
-        
-        log_info "Processing $component..."
-        log_info "  Source: $source_image"
-        log_info "  Target: $minikube_tag"
-        
-        # Pull the source image
-        if docker pull "$source_image"; then
-            log_success "  Pulled: $source_image"
-            
-            # Tag it for minikube if different
-            if [[ "$source_image" != "$minikube_tag" ]]; then
-                if docker tag "$source_image" "$minikube_tag"; then
-                    log_success "  Tagged as: $minikube_tag"
-                else
-                    log_error "  Failed to tag $source_image as $minikube_tag"
-                fi
-            else
-                log_info "  Already has correct tag"
-            fi
-        else
-            log_error "  Failed to pull: $source_image"
+    sudo apt-get install -y "${packages[@]}"
+    log_success "Dependencies installed successfully"
+}
+
+# Add Docker's official GPG key and repository
+add_docker_repo() {
+    log_info "Adding Docker repository..."
+    
+    # Remove any existing Docker packages
+    log_info "Removing any existing Docker packages..."
+    sudo apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
+    
+    # Add Docker's official GPG key
+    sudo mkdir -p /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    
+    # Add Docker repository
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+    
+    # Update package index
+    sudo apt-get update -qq
+    
+    log_success "Docker repository added successfully"
+}
+
+# Install Docker Engine
+install_docker() {
+    log_info "Installing Docker Engine..."
+    
+    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    
+    log_success "Docker Engine installed successfully"
+}
+
+# Configure Docker for WSL
+configure_docker_wsl() {
+    log_info "Configuring Docker for WSL..."
+    
+    # Add user to docker group
+    sudo usermod -aG docker "$USER"
+    
+    # Create docker directory for user
+    sudo mkdir -p /home/"$USER"/.docker
+    sudo chown "$USER":"$USER" /home/"$USER"/.docker -R
+    
+    # Configure Docker daemon for WSL
+    sudo mkdir -p /etc/docker
+    
+    cat << 'EOF' | sudo tee /etc/docker/daemon.json > /dev/null
+{
+    "hosts": ["unix:///var/run/docker.sock"],
+    "iptables": false,
+    "bridge": "none",
+    "ip-forward": false,
+    "ip-masq": false,
+    "userland-proxy": false,
+    "experimental": false,
+    "metrics-addr": "127.0.0.1:9323",
+    "log-driver": "json-file",
+    "log-opts": {
+        "max-size": "10m",
+        "max-file": "3"
+    }
+}
+EOF
+    
+    log_success "Docker configured for WSL"
+}
+
+# Create Docker service management script
+create_docker_service_script() {
+    log_info "Creating Docker service management script..."
+    
+    # Create a script to manage Docker service
+    cat << 'EOF' > /tmp/docker-service.sh
+#!/bin/bash
+
+# Docker service management for WSL
+SERVICE_NAME="docker"
+DOCKER_DIR="/var/run"
+DOCKER_SOCK="$DOCKER_DIR/docker.sock"
+
+start_docker() {
+    echo "Starting Docker service..."
+    
+    # Check if Docker is already running
+    if docker info >/dev/null 2>&1; then
+        echo "Docker is already running"
+        return 0
+    fi
+    
+    # Start Docker daemon
+    sudo dockerd >/dev/null 2>&1 &
+    
+    # Wait for Docker to start
+    local count=0
+    while ! docker info >/dev/null 2>&1; do
+        sleep 1
+        count=$((count + 1))
+        if [ $count -gt 30 ]; then
+            echo "Error: Docker failed to start within 30 seconds"
             return 1
         fi
-        echo
     done
     
-    log_success "All images pulled and tagged successfully!"
+    echo "Docker started successfully"
 }
 
-# Function to start minikube cluster (basic, no fancy flags)
-start_cluster() {
-    log_info "=== STEP 2: STARTING MINIKUBE CLUSTER ==="
+stop_docker() {
+    echo "Stopping Docker service..."
     
-    # Check if already running
-    if minikube status -p "$PROFILE_NAME" 2>/dev/null | grep -q "Running"; then
-        log_success "Cluster is already running!"
+    # Find and kill dockerd process
+    local docker_pid=$(pgrep dockerd)
+    if [ -n "$docker_pid" ]; then
+        sudo kill "$docker_pid"
+        echo "Docker stopped successfully"
+    else
+        echo "Docker is not running"
+    fi
+}
+
+restart_docker() {
+    stop_docker
+    sleep 2
+    start_docker
+}
+
+status_docker() {
+    if docker info >/dev/null 2>&1; then
+        echo "Docker is running"
+        docker --version
         return 0
-    fi
-    
-    # Start with minimal flags
-    log_info "Starting minikube cluster..."
-    
-    # Build command args
-    local start_args=(
-        "--driver=$MINIKUBE_DRIVER"
-        "--memory=$MINIKUBE_MEMORY"
-        "--cpus=$MINIKUBE_CPUS"
-        "--profile=$PROFILE_NAME"
-    )
-    
-    # Add custom kicbase if specified
-    if [[ -n "$CUSTOM_KICBASE_IMAGE" ]]; then
-        start_args+=("--base-image=$CUSTOM_KICBASE_IMAGE")
-        log_info "Using custom kicbase: $CUSTOM_KICBASE_IMAGE"
-    fi
-    
-    log_info "Command: minikube start ${start_args[*]}"
-    
-    if minikube start "${start_args[@]}"; then
-        log_success "Cluster started successfully!"
     else
-        log_error "Failed to start cluster"
+        echo "Docker is not running"
         return 1
     fi
 }
 
-# Function to load images into minikube
-load_images_into_minikube() {
-    log_info "=== STEP 3: LOADING IMAGES INTO MINIKUBE ==="
-    
-    # Check if cluster is running
-    if ! minikube status -p "$PROFILE_NAME" 2>/dev/null | grep -q "Running"; then
-        log_error "Cluster is not running!"
-        return 1
-    fi
-    
-    # Extract actual tags from custom images or use sensible defaults
-    local pause_tag="3.9"
-    local kube_tag="v1.31.1"
-    local etcd_tag="3.5.15-0"
-    local coredns_tag="v1.11.1"
-    local storage_tag="v5"
-    local kicbase_tag="v0.0.44"
-    
-    if [[ -n "$CUSTOM_PAUSE_IMAGE" ]]; then
-        pause_tag=$(extract_tag "$CUSTOM_PAUSE_IMAGE")
-    fi
-    if [[ -n "$CUSTOM_APISERVER_IMAGE" ]]; then
-        kube_tag=$(extract_tag "$CUSTOM_APISERVER_IMAGE")
-    fi
-    if [[ -n "$CUSTOM_ETCD_IMAGE" ]]; then
-        etcd_tag=$(extract_tag "$CUSTOM_ETCD_IMAGE")
-    fi
-    if [[ -n "$CUSTOM_COREDNS_IMAGE" ]]; then
-        coredns_tag=$(extract_tag "$CUSTOM_COREDNS_IMAGE")
-    fi
-    if [[ -n "$CUSTOM_STORAGE_IMAGE" ]]; then
-        storage_tag=$(extract_tag "$CUSTOM_STORAGE_IMAGE")
-    fi
-    if [[ -n "$CUSTOM_KICBASE_IMAGE" ]]; then
-        kicbase_tag=$(extract_tag "$CUSTOM_KICBASE_IMAGE")
-    fi
-    
-    # List of images to load using extracted tags
-    local images_to_load=(
-        "registry.k8s.io/pause:$pause_tag"
-        "registry.k8s.io/kube-apiserver:$kube_tag"
-        "registry.k8s.io/kube-controller-manager:$kube_tag"
-        "registry.k8s.io/kube-scheduler:$kube_tag"
-        "registry.k8s.io/kube-proxy:$kube_tag"
-        "registry.k8s.io/etcd:$etcd_tag"
-        "registry.k8s.io/coredns/coredns:$coredns_tag"
-        "gcr.io/k8s-minikube/storage-provisioner:$storage_tag"
-    )
-    
-    # Add kicbase if we have a custom one
-    if [[ -n "$CUSTOM_KICBASE_IMAGE" ]]; then
-        images_to_load+=("gcr.io/k8s-minikube/kicbase:$kicbase_tag")
-    fi
-    
-    for image in "${images_to_load[@]}"; do
-        log_info "Loading $image into minikube..."
-        if minikube image load "$image" -p "$PROFILE_NAME"; then
-            log_success "  Loaded: $image"
-        else
-            log_warning "  Failed to load: $image"
-        fi
-    done
-    
-    log_success "Image loading completed!"
-}
-
-# Function to verify images in minikube
-verify_images() {
-    log_info "=== STEP 4: VERIFYING IMAGES IN MINIKUBE ==="
-    
-    log_info "Images available in minikube:"
-    minikube ssh -p "$PROFILE_NAME" -- "docker images | grep -E '(registry\.k8s\.io|gcr\.io)'" || true
-}
-
-# Function to show cluster info
-show_status() {
-    log_info "=== CLUSTER STATUS ==="
-    
-    if minikube status -p "$PROFILE_NAME" 2>/dev/null; then
-        echo
-        log_info "Cluster IP: $(minikube ip -p "$PROFILE_NAME" 2>/dev/null || echo 'Not available')"
-        log_info "Dashboard: minikube dashboard -p $PROFILE_NAME"
-        echo
-        log_info "Quick commands:"
-        echo "  kubectl get nodes"
-        echo "  kubectl get pods -A"
-    else
-        log_warning "No cluster found"
-    fi
-}
-
-# Main execution functions
-do_full_setup() {
-    log_info "Starting complete setup..."
-    pull_and_tag_images
-    start_cluster
-    load_images_into_minikube
-    verify_images
-    show_status
-    log_success "Complete setup finished!"
-}
-
-do_pull_only() {
-    log_info "Pulling and tagging images only..."
-    pull_and_tag_images
-}
-
-do_start_only() {
-    log_info "Starting cluster only..."
-    start_cluster
-    show_status
-}
-
-do_load_only() {
-    log_info "Loading images into existing cluster..."
-    load_images_into_minikube
-    verify_images
-}
-
-do_clean() {
-    log_info "Cleaning up cluster..."
-    minikube delete -p "$PROFILE_NAME" || true
-    log_success "Cleanup completed!"
-}
-
-# Help function
-show_help() {
-    cat << EOF
-Simple Minikube Image Management Script
-
-USAGE:
-    $0 [COMMAND]
-
-COMMANDS:
-    setup       Pull images, start cluster, load images (complete setup)
-    pull        Pull and tag images only
-    start       Start minikube cluster only
-    load        Load already-pulled images into running cluster
-    verify      Show images in minikube
-    status      Show cluster status
-    clean       Delete cluster
-    help        Show this help
-
-CUSTOM IMAGES:
-    Edit the script and set these variables to use custom registries:
-    - CUSTOM_PAUSE_IMAGE="your-registry.com/pause:3.9"
-    - CUSTOM_APISERVER_IMAGE="your-registry.com/kube-apiserver:v1.31.1"
-    - etc.
-
-EXAMPLES:
-    $0 setup      # Complete setup from scratch
-    $0 pull       # Just pull and tag images
-    $0 start      # Just start cluster
-    $0 load       # Load images into running cluster
-    $0 clean      # Clean up everything
-
-PREREQUISITES:
-    Before using this script, install Docker on Ubuntu WSL:
-    
-    1. Download the Docker setup script
-    2. Run: chmod +x docker-setup.sh
-    3. Run: ./docker-setup.sh install
-    4. Start new terminal or run: newgrp docker
-    5. Start Docker: docker-service start
-    
-    Then you can use this minikube script.
-
+case "$1" in
+    start)
+        start_docker
+        ;;
+    stop)
+        stop_docker
+        ;;
+    restart)
+        restart_docker
+        ;;
+    status)
+        status_docker
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
 EOF
+    
+    # Install the service script
+    sudo mv /tmp/docker-service.sh /usr/local/bin/docker-service
+    sudo chmod +x /usr/local/bin/docker-service
+    
+    log_success "Docker service script created at /usr/local/bin/docker-service"
 }
 
-# Main script logic
+# Create auto-start script for .bashrc
+create_autostart_script() {
+    log_info "Setting up Docker auto-start..."
+    
+    # Create auto-start function
+    cat << 'EOF' >> ~/.bashrc
+
+# Docker auto-start function for WSL
+start_docker_if_needed() {
+    if ! docker info >/dev/null 2>&1; then
+        echo "Starting Docker..."
+        /usr/local/bin/docker-service start
+    fi
+}
+
+# Auto-start Docker when opening new terminal (optional)
+# Uncomment the next line if you want Docker to start automatically
+# start_docker_if_needed
+EOF
+    
+    log_success "Auto-start script added to ~/.bashrc"
+}
+
+# Test Docker installation
+test_docker() {
+    log_info "Testing Docker installation..."
+    
+    # Start Docker service
+    /usr/local/bin/docker-service start
+    
+    # Test Docker
+    if docker --version; then
+        log_success "Docker version check passed"
+    else
+        log_error "Docker version check failed"
+        return 1
+    fi
+    
+    # Test Docker run
+    if docker run --rm hello-world; then
+        log_success "Docker run test passed"
+    else
+        log_error "Docker run test failed"
+        return 1
+    fi
+    
+    log_success "Docker installation test completed successfully!"
+}
+
+# Install Docker Compose (standalone)
+install_docker_compose() {
+    log_info "Installing Docker Compose..."
+    
+    # Get latest version
+    local compose_version=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep 'tag_name' | cut -d\" -f4)
+    
+    # Download and install
+    sudo curl -L "https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+    sudo chmod +x /usr/local/bin/docker-compose
+    
+    # Create symlink
+    sudo ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+    
+    log_success "Docker Compose ${compose_version} installed successfully"
+}
+
+# Show usage instructions
+show_usage() {
+    echo
+    echo "========================================"
+    log_success "Docker installation completed!"
+    echo "========================================"
+    echo
+    log_info "Docker Service Management:"
+    echo "  /usr/local/bin/docker-service start    # Start Docker"
+    echo "  /usr/local/bin/docker-service stop     # Stop Docker"
+    echo "  /usr/local/bin/docker-service restart  # Restart Docker"
+    echo "  /usr/local/bin/docker-service status   # Check Docker status"
+    echo
+    log_info "Quick Commands:"
+    echo "  docker-service start    # Start Docker"
+    echo "  docker --version        # Check Docker version"
+    echo "  docker run hello-world  # Test Docker"
+    echo
+    log_warning "Important Notes:"
+    echo "  1. You need to start a new terminal session or run 'newgrp docker' for group changes to take effect"
+    echo "  2. Docker doesn't auto-start like systemd services in WSL"
+    echo "  3. Use 'docker-service start' to start Docker when needed"
+    echo "  4. Uncomment the auto-start line in ~/.bashrc if you want Docker to start automatically"
+    echo
+    log_info "To start Docker now, run:"
+    echo "  newgrp docker"
+    echo "  docker-service start"
+    echo
+}
+
+# Main installation function
 main() {
-    case "${1:-}" in
-        setup)
-            do_full_setup
-            ;;
-        pull)
-            do_pull_only
-            ;;
-        start)
-            do_start_only
-            ;;
-        load)
-            do_load_only
-            ;;
-        verify)
-            verify_images
-            ;;
-        status)
-            show_status
-            ;;
-        clean)
-            do_clean
-            ;;
-        help|--help|-h|"")
-            show_help
-            ;;
-        *)
-            log_error "Unknown command: $1"
-            echo
-            show_help
-            exit 1
-            ;;
-    esac
+    log_info "Starting Docker installation for Ubuntu WSL..."
+    echo
+    
+    # Pre-flight checks
+    check_not_root
+    
+    if ! is_wsl; then
+        log_warning "This script is optimized for WSL, but continuing anyway..."
+    fi
+    
+    # Installation steps
+    update_system
+    install_dependencies
+    add_docker_repo
+    install_docker
+    configure_docker_wsl
+    create_docker_service_script
+    create_autostart_script
+    install_docker_compose
+    
+    # Test installation (in new group context)
+    log_info "Testing Docker installation..."
+    log_info "Note: Group changes require a new shell session"
+    
+    show_usage
 }
 
-main "$@"
+# Command line options
+case "${1:-}" in
+    install)
+        main
+        ;;
+    start)
+        /usr/local/bin/docker-service start
+        ;;
+    stop)
+        /usr/local/bin/docker-service stop
+        ;;
+    restart)
+        /usr/local/bin/docker-service restart
+        ;;
+    status)
+        /usr/local/bin/docker-service status
+        ;;
+    test)
+        test_docker
+        ;;
+    help|--help|-h)
+        echo "Ubuntu Docker Setup for WSL"
+        echo
+        echo "Usage: $0 [COMMAND]"
+        echo
+        echo "Commands:"
+        echo "  install   Install Docker on Ubuntu WSL"
+        echo "  start     Start Docker service"
+        echo "  stop      Stop Docker service"
+        echo "  restart   Restart Docker service"
+        echo "  status    Check Docker service status"
+        echo "  test      Test Docker installation"
+        echo "  help      Show this help"
+        echo
+        ;;
+    "")
+        main
+        ;;
+    *)
+        log_error "Unknown command: $1"
+        echo "Use '$0 help' for usage information"
+        exit 1
+        ;;
+esac
