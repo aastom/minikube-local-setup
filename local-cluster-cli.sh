@@ -41,16 +41,50 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-# Function to extract tag from image URL
+# Function to extract tag from image URL (handles complex URLs with multiple colons)
 extract_tag() {
     local image_url="$1"
-    echo "${image_url##*:}"
+    
+    # Debug: show what we're parsing
+    log_info "  Parsing URL: $image_url"
+    
+    # For your specific URL format: europe-docker.pkg.dev/.../registry.k8s.io/component:tag
+    # The tag is after the last colon, but we need to be careful about registry URLs
+    
+    # Look for pattern: /component:tag at the very end
+    if [[ "$image_url" =~ /([^/]+):([^/:]+)$ ]]; then
+        local component="${BASH_REMATCH[1]}"
+        local tag="${BASH_REMATCH[2]}"
+        log_info "  Found component: $component, tag: $tag"
+        echo "$tag"
+        return 0
+    fi
+    
+    # Fallback: split by colon and take the last part if it doesn't contain slashes
+    local last_colon_part="${image_url##*:}"
+    if [[ "$last_colon_part" != *"/"* ]]; then
+        log_info "  Extracted tag (fallback): $last_colon_part"
+        echo "$last_colon_part"
+        return 0
+    fi
+    
+    # If we get here, something's wrong with the URL format
+    log_warning "  Could not extract tag from: $image_url"
+    log_warning "  Using 'latest' as fallback"
+    echo "latest"
 }
 
-# Function to extract repository path from image URL (everything before the tag)
+# Function to extract repository path from image URL (everything before the last colon that's a tag)
 extract_repo() {
     local image_url="$1"
-    echo "${image_url%:*}"
+    local tag=$(extract_tag "$image_url")
+    
+    # If tag is "latest" and not explicitly in URL, return the full URL
+    if [[ "$tag" == "latest" && "$image_url" != *":latest" ]]; then
+        echo "$image_url"
+    else
+        echo "${image_url%:$tag}"
+    fi
 }
 
 # Function to pull and tag images
@@ -65,24 +99,33 @@ pull_and_tag_images() {
     local storage_tag="${STORAGE_PROVISIONER_VERSION}"
     local kicbase_tag="v0.0.47"
     
+    log_info "=== TAG EXTRACTION DEBUG ==="
     if [[ -n "$CUSTOM_PAUSE_IMAGE" ]]; then
+        log_info "CUSTOM_PAUSE_IMAGE: $CUSTOM_PAUSE_IMAGE"
         pause_tag=$(extract_tag "$CUSTOM_PAUSE_IMAGE")
     fi
     if [[ -n "$CUSTOM_APISERVER_IMAGE" ]]; then
+        log_info "CUSTOM_APISERVER_IMAGE: $CUSTOM_APISERVER_IMAGE"
         kube_tag=$(extract_tag "$CUSTOM_APISERVER_IMAGE")
     fi
     if [[ -n "$CUSTOM_ETCD_IMAGE" ]]; then
+        log_info "CUSTOM_ETCD_IMAGE: $CUSTOM_ETCD_IMAGE"
         etcd_tag=$(extract_tag "$CUSTOM_ETCD_IMAGE")
     fi
     if [[ -n "$CUSTOM_COREDNS_IMAGE" ]]; then
+        log_info "CUSTOM_COREDNS_IMAGE: $CUSTOM_COREDNS_IMAGE"
         coredns_tag=$(extract_tag "$CUSTOM_COREDNS_IMAGE")
     fi
     if [[ -n "$CUSTOM_STORAGE_IMAGE" ]]; then
+        log_info "CUSTOM_STORAGE_IMAGE: $CUSTOM_STORAGE_IMAGE"
         storage_tag=$(extract_tag "$CUSTOM_STORAGE_IMAGE")
     fi
     if [[ -n "$CUSTOM_KICBASE_IMAGE" ]]; then
+        log_info "CUSTOM_KICBASE_IMAGE: $CUSTOM_KICBASE_IMAGE"
         kicbase_tag=$(extract_tag "$CUSTOM_KICBASE_IMAGE")
     fi
+    log_info "=== END DEBUG ==="
+    echo
     
     log_info "Extracted tags:"
     log_info "  pause: $pause_tag"
