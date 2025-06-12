@@ -325,20 +325,47 @@ install_kubectl() {
     kubectl version --client
 }
 
-# Pre-pull required images
-pre_pull_images() {
-    log_info "Pre-pulling required Kubernetes images..."
+# Get minikube expected image tags
+get_minikube_image_tags() {
+    local component=$1
+    local version=$2
     
-    # Define images with their custom URLs or defaults
-    local images=(
-        "pause:$(get_image_url "pause" "$PAUSE_IMAGE" "pause" "$PAUSE_VERSION")"
-        "kube-apiserver:$(get_image_url "apiserver" "$KUBE_APISERVER_IMAGE" "kube-apiserver" "$KUBE_VERSION")"
-        "kube-controller-manager:$(get_image_url "controller-manager" "$KUBE_CONTROLLER_MANAGER_IMAGE" "kube-controller-manager" "$KUBE_VERSION")"
-        "kube-scheduler:$(get_image_url "scheduler" "$KUBE_SCHEDULER_IMAGE" "kube-scheduler" "$KUBE_VERSION")"
-        "kube-proxy:$(get_image_url "proxy" "$KUBE_PROXY_IMAGE" "kube-proxy" "$KUBE_VERSION")"
-        "etcd:$(get_image_url "etcd" "$ETCD_IMAGE" "etcd" "$ETCD_VERSION")"
-        "coredns:$(get_image_url "coredns" "$COREDNS_IMAGE" "coredns" "$COREDNS_VERSION")"
-        "storage-provisioner:$(get_image_url "storage-provisioner" "$STORAGE_PROVISIONER_IMAGE" "storage-provisioner" "$STORAGE_PROVISIONER_VERSION")"
+    case $component in
+        "pause")
+            echo "registry.k8s.io/pause:${version}"
+            ;;
+        "kube-apiserver"|"kube-controller-manager"|"kube-scheduler"|"kube-proxy")
+            echo "registry.k8s.io/${component}:${version}"
+            ;;
+        "etcd")
+            echo "registry.k8s.io/etcd:${version}"
+            ;;
+        "coredns")
+            echo "registry.k8s.io/coredns/coredns:${version}"
+            ;;
+        "storage-provisioner")
+            echo "gcr.io/k8s-minikube/storage-provisioner:${version}"
+            ;;
+        *)
+            echo "registry.k8s.io/${component}:${version}"
+            ;;
+    esac
+}
+
+# Pre-pull and tag images for minikube
+pre_pull_and_tag_images() {
+    log_info "Pre-pulling and tagging required Kubernetes images..."
+    
+    # Define image mappings: component:custom_url:default_component:version
+    local image_mappings=(
+        "pause:${PAUSE_IMAGE}:pause:${PAUSE_VERSION}"
+        "kube-apiserver:${KUBE_APISERVER_IMAGE}:kube-apiserver:${KUBE_VERSION}"
+        "kube-controller-manager:${KUBE_CONTROLLER_MANAGER_IMAGE}:kube-controller-manager:${KUBE_VERSION}"
+        "kube-scheduler:${KUBE_SCHEDULER_IMAGE}:kube-scheduler:${KUBE_VERSION}"
+        "kube-proxy:${KUBE_PROXY_IMAGE}:kube-proxy:${KUBE_VERSION}"
+        "etcd:${ETCD_IMAGE}:etcd:${ETCD_VERSION}"
+        "coredns:${COREDNS_IMAGE}:coredns:${COREDNS_VERSION}"
+        "storage-provisioner:${STORAGE_PROVISIONER_IMAGE}:storage-provisioner:${STORAGE_PROVISIONER_VERSION}"
     )
     
     # Also pre-pull kicbase if specified
@@ -354,35 +381,60 @@ pre_pull_images() {
     
     local pull_failures=0
     local pull_successes=0
+    local tag_successes=0
     
-    for image_spec in "${images[@]}"; do
-        local component="${image_spec%%:*}"
-        local image_url="${image_spec#*:}"
+    for mapping in "${image_mappings[@]}"; do
+        IFS=':' read -r component custom_url default_component version <<< "$mapping"
         
-        log_info "Pulling $component: $image_url"
-        
-        if docker pull "$image_url" 2>/dev/null; then
-            log_success "Successfully pulled $image_url"
-            ((pull_successes++))
+        # Determine source image URL
+        local source_image
+        if [[ -n "$custom_url" ]]; then
+            source_image="$custom_url"
         else
-            log_warning "Failed to pull $image_url, trying fallback registries"
+            source_image="${DEFAULT_REGISTRY}/${default_component}:${version}"
+        fi
+        
+        # Get expected minikube tag
+        local minikube_tag
+        minikube_tag=$(get_minikube_image_tags "$component" "$version")
+        
+        log_info "Processing $component: $source_image"
+        
+        # Pull the image
+        if docker pull "$source_image" 2>/dev/null; then
+            log_success "Successfully pulled $source_image"
+            ((pull_successes++))
+            
+            # Tag for minikube if different from source
+            if [[ "$source_image" != "$minikube_tag" ]]; then
+                if docker tag "$source_image" "$minikube_tag" 2>/dev/null; then
+                    log_success "Tagged as $minikube_tag"
+                    ((tag_successes++))
+                else
+                    log_warning "Failed to tag $source_image as $minikube_tag"
+                fi
+            else
+                log_info "Image already has correct tag for minikube"
+                ((tag_successes++))
+            fi
+        else
+            log_warning "Failed to pull $source_image, trying fallback registries"
             
             # Try alternative registries for standard images
-            local component_name="${component}"
-            local version="${image_url##*:}"
             local fallback_success=false
             
-            for alt_reg in "k8s.gcr.io" "gcr.io/k8s-minikube" "$DEFAULT_REGISTRY"; do
-                local alt_image="${alt_reg}/${component_name}:${version}"
+            for alt_reg in "k8s.gcr.io" "gcr.io/k8s-minikube"; do
+                local alt_image="${alt_reg}/${default_component}:${version}"
                 log_info "Trying fallback: $alt_image"
                 if docker pull "$alt_image" 2>/dev/null; then
-                    if docker tag "$alt_image" "$image_url" 2>/dev/null; then
-                        log_success "Tagged fallback $alt_image as $image_url"
+                    if docker tag "$alt_image" "$minikube_tag" 2>/dev/null; then
+                        log_success "Tagged fallback $alt_image as $minikube_tag"
                         fallback_success=true
                         ((pull_successes++))
+                        ((tag_successes++))
                         break
                     else
-                        log_warning "Failed to tag $alt_image as $image_url"
+                        log_warning "Failed to tag $alt_image as $minikube_tag"
                     fi
                 fi
             done
@@ -394,14 +446,50 @@ pre_pull_images() {
         fi
     done
     
-    log_info "Image pre-pull summary: $pull_successes successful, $pull_failures failed"
+    log_info "Image processing summary:"
+    log_info "  Pulls: $pull_successes successful, $pull_failures failed"
+    log_info "  Tags: $tag_successes successful"
+    
     if [[ $pull_failures -gt 0 ]]; then
         log_warning "Some images failed to pre-pull, but continuing with cluster start"
         log_info "Minikube will attempt to download missing images during startup"
     fi
     
-    # Always return success to continue with cluster start
+    # Save image manifest for minikube
+    save_image_manifest
+    
     return 0
+}
+
+# Save image manifest to prevent remote pulls
+save_image_manifest() {
+    local manifest_file="$CONFIG_DIR/image-manifest.txt"
+    log_info "Saving local image manifest to $manifest_file"
+    
+    # List all locally available Kubernetes images
+    docker images --format "table {{.Repository}}:{{.Tag}}" | grep -E "(registry\.k8s\.io|gcr\.io|k8s\.gcr\.io)" > "$manifest_file" 2>/dev/null || true
+    
+    if [[ -s "$manifest_file" ]]; then
+        log_success "Image manifest saved with $(wc -l < "$manifest_file") images"
+        log_info "Local images will be preferred during cluster start"
+    else
+        log_warning "No Kubernetes images found locally"
+    fi
+}
+
+# Configure minikube to use local images
+configure_minikube_local_images() {
+    log_info "Configuring minikube to prefer local images..."
+    
+    # Set minikube to use local docker daemon and prefer local images
+    minikube config set driver "$MINIKUBE_DRIVER" -p "$PROFILE_NAME" 2>/dev/null || true
+    minikube config set image-mirror-country "" -p "$PROFILE_NAME" 2>/dev/null || true
+    minikube config set image-repository "" -p "$PROFILE_NAME" 2>/dev/null || true
+    
+    # Configure to skip pulling if images exist locally
+    export MINIKUBE_PULL_POLICY="IfNotPresent"
+    
+    log_success "Minikube configured to prefer local images"
 }
 
 # Start minikube cluster
@@ -420,11 +508,9 @@ start_minikube() {
     
     # Check if Docker is accessible and try to pre-pull images
     if docker info >/dev/null 2>&1; then
-        log_info "Docker is accessible, attempting to pre-pull images..."
-        # Call pre_pull_images but don't let it stop the script
-        if ! pre_pull_images; then
-            log_warning "Image pre-pulling encountered issues, but continuing with cluster start"
-        fi
+        log_info "Docker is accessible, processing images..."
+        configure_minikube_local_images
+        pre_pull_and_tag_images
     else
         log_warning "Docker not accessible, skipping image pre-pull"
         log_info "Images will be downloaded during cluster start"
@@ -432,101 +518,64 @@ start_minikube() {
     
     log_info "Proceeding with cluster start..."
     
-    # Build minikube start command with shorter, validated parameters
-    local start_cmd="minikube start"
-    start_cmd+=" --driver=$MINIKUBE_DRIVER"
-    start_cmd+=" --memory=$MINIKUBE_MEMORY"
-    start_cmd+=" --cpus=$MINIKUBE_CPUS"
-    start_cmd+=" --disk-size=$MINIKUBE_DISK_SIZE"
-    start_cmd+=" --profile=$PROFILE_NAME"
-    start_cmd+=" --insecure-registry=\"$INSECURE_REGISTRIES\""
-    start_cmd+=" --embed-certs=true"
-    start_cmd+=" --delete-on-failure"
+    # Build minikube start command
+    local start_args=(
+        "--driver=$MINIKUBE_DRIVER"
+        "--memory=$MINIKUBE_MEMORY"
+        "--cpus=$MINIKUBE_CPUS"
+        "--disk-size=$MINIKUBE_DISK_SIZE"
+        "--profile=$PROFILE_NAME"
+        "--insecure-registry=$INSECURE_REGISTRIES"
+        "--embed-certs=true"
+        "--delete-on-failure"
+        "--pull-policy=IfNotPresent"
+    )
     
-    # Add custom kicbase image if specified and validate it
+    # Add custom kicbase image if specified
     if [[ -n "$KICBASE_IMAGE" ]]; then
-        # Validate kicbase image URL length (minikube has limits)
-        if [[ ${#KICBASE_IMAGE} -gt 200 ]]; then
-            log_warning "Kicbase image URL is very long (${#KICBASE_IMAGE} chars), this may cause issues"
-            log_warning "Consider using a shorter registry path or image name"
-        fi
-        start_cmd+=" --base-image=\"$KICBASE_IMAGE\""
+        start_args+=("--base-image=$KICBASE_IMAGE")
         log_info "Using custom kicbase image: $KICBASE_IMAGE"
-    else
-        log_info "Using default kicbase image"
     fi
     
     # Add individual image overrides with validation
     local image_overrides_count=0
     
     if [[ -n "$PAUSE_IMAGE" ]]; then
-        start_cmd+=" --extra-config=kubelet.pod-infra-container-image=\"$PAUSE_IMAGE\""
+        start_args+=("--extra-config=kubelet.pod-infra-container-image=$PAUSE_IMAGE")
         log_info "Using custom pause image: $PAUSE_IMAGE"
         ((image_overrides_count++))
     fi
     
     if [[ -n "$KUBE_APISERVER_IMAGE" ]]; then
-        start_cmd+=" --extra-config=apiserver.image=\"$KUBE_APISERVER_IMAGE\""
+        start_args+=("--extra-config=apiserver.image=$KUBE_APISERVER_IMAGE")
         log_info "Using custom apiserver image: $KUBE_APISERVER_IMAGE"
         ((image_overrides_count++))
     fi
     
     if [[ -n "$KUBE_CONTROLLER_MANAGER_IMAGE" ]]; then
-        start_cmd+=" --extra-config=controller-manager.image=\"$KUBE_CONTROLLER_MANAGER_IMAGE\""
+        start_args+=("--extra-config=controller-manager.image=$KUBE_CONTROLLER_MANAGER_IMAGE")
         log_info "Using custom controller-manager image: $KUBE_CONTROLLER_MANAGER_IMAGE"
         ((image_overrides_count++))
     fi
     
     if [[ -n "$KUBE_SCHEDULER_IMAGE" ]]; then
-        start_cmd+=" --extra-config=scheduler.image=\"$KUBE_SCHEDULER_IMAGE\""
+        start_args+=("--extra-config=scheduler.image=$KUBE_SCHEDULER_IMAGE")
         log_info "Using custom scheduler image: $KUBE_SCHEDULER_IMAGE"
         ((image_overrides_count++))
     fi
     
     if [[ -n "$ETCD_IMAGE" ]]; then
-        start_cmd+=" --extra-config=etcd.image=\"$ETCD_IMAGE\""
+        start_args+=("--extra-config=etcd.image=$ETCD_IMAGE")
         log_info "Using custom etcd image: $ETCD_IMAGE"
         ((image_overrides_count++))
     fi
-    
-    # Note: storage-provisioner and coredns are handled post-startup
-    if [[ -n "$STORAGE_PROVISIONER_IMAGE" ]]; then
-        log_info "Custom storage-provisioner image specified: $STORAGE_PROVISIONER_IMAGE"
-        log_info "Will configure storage-provisioner after cluster starts"
-    fi
-    
-    if [[ -n "$COREDNS_IMAGE" ]]; then
-        log_info "Custom coredns image specified: $COREDNS_IMAGE"
-        log_info "Will configure coredns after cluster starts"
-    fi
-    
-    if [[ $image_overrides_count -gt 0 ]]; then
-        log_info "Total custom images configured: $image_overrides_count"
-    else
-        log_info "Using default images from $DEFAULT_REGISTRY"
-    fi
-    
-    # Debug: Check if minikube command exists
-    if ! command_exists minikube; then
-        log_error "Minikube command not found! Please install minikube first."
-        return 1
-    fi
-    
-    # Debug: Show minikube version
-    log_info "Minikube version: $(minikube version --short 2>/dev/null || echo 'unknown')"
     
     log_info "=== STARTING MINIKUBE CLUSTER ==="
     log_info "Profile: $PROFILE_NAME"
     log_info "Driver: $MINIKUBE_DRIVER"
     log_info "Memory: ${MINIKUBE_MEMORY}MB"
     log_info "CPUs: $MINIKUBE_CPUS"
-    
-    # Debug: Show the command that will be executed
-    log_info "Minikube command to execute:"
-    log_info "$start_cmd"
-    
-    # Alternative: Try executing minikube directly with individual arguments
-    log_info "=== ATTEMPTING MINIKUBE START ==="
+    log_info "Image overrides: $image_overrides_count"
     
     # Start cluster with retry logic
     local retry_count=0
@@ -535,28 +584,8 @@ start_minikube() {
     while [[ $retry_count -lt $max_retries ]]; do
         log_info "=== CLUSTER START ATTEMPT $((retry_count + 1))/$max_retries ==="
         
-        # Try a more direct approach first
-        log_info "Starting minikube cluster..."
-        
-        # Execute minikube start with explicit arguments to avoid command parsing issues
         set +e  # Temporarily disable exit on error
-        
-        minikube start \
-            --driver="$MINIKUBE_DRIVER" \
-            --memory="$MINIKUBE_MEMORY" \
-            --cpus="$MINIKUBE_CPUS" \
-            --disk-size="$MINIKUBE_DISK_SIZE" \
-            --profile="$PROFILE_NAME" \
-            --insecure-registry="$INSECURE_REGISTRIES" \
-            --embed-certs=true \
-            --delete-on-failure \
-            ${KICBASE_IMAGE:+--base-image="$KICBASE_IMAGE"} \
-            ${PAUSE_IMAGE:+--extra-config=kubelet.pod-infra-container-image="$PAUSE_IMAGE"} \
-            ${KUBE_APISERVER_IMAGE:+--extra-config=apiserver.image="$KUBE_APISERVER_IMAGE"} \
-            ${KUBE_CONTROLLER_MANAGER_IMAGE:+--extra-config=controller-manager.image="$KUBE_CONTROLLER_MANAGER_IMAGE"} \
-            ${KUBE_SCHEDULER_IMAGE:+--extra-config=scheduler.image="$KUBE_SCHEDULER_IMAGE"} \
-            ${ETCD_IMAGE:+--extra-config=etcd.image="$ETCD_IMAGE"}
-        
+        minikube start "${start_args[@]}"
         local start_exit_code=$?
         set -e  # Re-enable exit on error
         
@@ -581,8 +610,6 @@ start_minikube() {
         fi
     done
     
-    log_info "Cluster start phase completed, checking status..."
-    
     # Wait for cluster to be ready
     log_info "Waiting for cluster to be ready..."
     local ready_retry=0
@@ -594,6 +621,16 @@ start_minikube() {
         sleep 5
         ((ready_retry++))
     done
+    
+    # Configure post-startup components
+    configure_post_startup_components
+    
+    show_cluster_info
+}
+
+# Configure components that need post-startup configuration
+configure_post_startup_components() {
+    log_info "Configuring post-startup components..."
     
     # Enable essential addons
     log_info "Enabling addons..."
@@ -609,14 +646,10 @@ start_minikube() {
     if [[ -n "$STORAGE_PROVISIONER_IMAGE" ]]; then
         log_info "Configuring custom storage-provisioner image..."
         
-        # Enable storage-provisioner addon first
         if minikube addons enable storage-provisioner -p "$PROFILE_NAME" 2>/dev/null; then
             log_success "Enabled storage-provisioner addon"
-            
-            # Wait a moment for the addon to be ready
             sleep 5
             
-            # Update the storage-provisioner deployment with custom image
             if kubectl patch deployment storage-provisioner -n kube-system -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"storage-provisioner\",\"image\":\"$STORAGE_PROVISIONER_IMAGE\"}]}}}}" 2>/dev/null; then
                 log_success "Updated storage-provisioner to use custom image: $STORAGE_PROVISIONER_IMAGE"
             else
@@ -626,15 +659,22 @@ start_minikube() {
             log_warning "Failed to enable storage-provisioner addon"
         fi
     else
-        # Enable default storage-provisioner
         if minikube addons enable storage-provisioner -p "$PROFILE_NAME" 2>/dev/null; then
             log_success "Enabled storage-provisioner addon"
-        else
-            log_warning "Failed to enable storage-provisioner addon"
         fi
     fi
     
-    show_cluster_info
+    # Configure CoreDNS with custom image if specified
+    if [[ -n "$COREDNS_IMAGE" ]]; then
+        log_info "Configuring custom CoreDNS image..."
+        sleep 5
+        
+        if kubectl patch deployment coredns -n kube-system -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"coredns\",\"image\":\"$COREDNS_IMAGE\"}]}}}}" 2>/dev/null; then
+            log_success "Updated CoreDNS to use custom image: $COREDNS_IMAGE"
+        else
+            log_warning "Failed to update CoreDNS image, using default"
+        fi
+    fi
 }
 
 # Stop minikube cluster
@@ -668,6 +708,10 @@ delete_minikube() {
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         minikube delete -p "$PROFILE_NAME"
         log_success "Cluster deleted successfully!"
+        
+        # Clean up saved manifests
+        rm -f "$CONFIG_DIR/image-manifest.txt"
+        log_info "Cleaned up local image manifests"
     else
         log_info "Deletion cancelled"
     fi
@@ -691,6 +735,14 @@ show_cluster_info() {
             echo "  kubectl get nodes"
             echo "  kubectl get pods -A"
             echo "  minikube logs -p $PROFILE_NAME"
+            echo
+            echo "Local images status:"
+            local manifest_file="$CONFIG_DIR/image-manifest.txt"
+            if [[ -f "$manifest_file" ]]; then
+                echo "  $(wc -l < "$manifest_file") Kubernetes images cached locally"
+            else
+                echo "  No local image cache found"
+            fi
         fi
     else
         echo "No cluster found"
@@ -711,6 +763,7 @@ troubleshoot() {
         if docker info >/dev/null 2>&1; then
             echo "  ✓ Docker accessible"
             docker version --format "  Client: {{.Client.Version}}, Server: {{.Server.Version}}"
+            echo "  Local K8s images: $(docker images --format "table {{.Repository}}:{{.Tag}}" | grep -E "(registry\.k8s\.io|gcr\.io|k8s\.gcr\.io)" | wc -l)"
         else
             echo "  ✗ Docker not accessible"
         fi
@@ -722,11 +775,18 @@ troubleshoot() {
     echo "Kubernetes Tools:"
     for tool in minikube kubectl; do
         if command_exists "$tool"; then
-            echo "  ✓ $tool installed"
+            echo "  ✓ $tool installed ($(${tool} version --short 2>/dev/null || ${tool} version --client --short 2>/dev/null || echo 'version unknown'))"
         else
             echo "  ✗ $tool not installed"
         fi
     done
+    echo
+    
+    echo "Configuration:"
+    echo "  Config dir: $CONFIG_DIR"
+    echo "  Log file: $LOG_FILE"
+    echo "  Image config: $(if [[ -f "$CONFIG_DIR/images.conf" ]]; then echo "Present"; else echo "Not found"; fi)"
+    echo "  Image manifest: $(if [[ -f "$CONFIG_DIR/image-manifest.txt" ]]; then echo "Present ($(wc -l < "$CONFIG_DIR/image-manifest.txt") images)"; else echo "Not found"; fi)"
     echo
     
     echo "Network Connectivity:"
@@ -739,11 +799,55 @@ troubleshoot() {
     done
     echo
     
+    echo "Cluster Status:"
+    if command_exists minikube; then
+        if minikube status -p "$PROFILE_NAME" >/dev/null 2>&1; then
+            echo "  Profile '$PROFILE_NAME' exists"
+            minikube status -p "$PROFILE_NAME" | sed 's/^/    /'
+        else
+            echo "  No cluster found with profile '$PROFILE_NAME'"
+        fi
+    else
+        echo "  Minikube not available"
+    fi
+    echo
+    
     echo "Recommended Actions:"
     echo "1. Ensure Docker Desktop is running on Windows"
     echo "2. Run: $0 setup-docker (to configure Windows Docker wrapper)"
     echo "3. Run: $0 fresh-install (for complete setup)"
+    echo "4. Run: $0 configure-images (to set custom image URLs)"
     echo
+}
+
+# Clean up local images
+clean_images() {
+    log_info "Cleaning up local Kubernetes images..."
+    
+    if ! docker info >/dev/null 2>&1; then
+        log_error "Docker not accessible"
+        exit 1
+    fi
+    
+    read -p "Remove all local Kubernetes images? This will force re-download on next start (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        # Remove Kubernetes images
+        local removed_count=0
+        for image in $(docker images --format "{{.Repository}}:{{.Tag}}" | grep -E "(registry\.k8s\.io|gcr\.io|k8s\.gcr\.io)"); do
+            if docker rmi "$image" 2>/dev/null; then
+                log_info "Removed: $image"
+                ((removed_count++))
+            fi
+        done
+        
+        # Clean up manifests
+        rm -f "$CONFIG_DIR/image-manifest.txt"
+        
+        log_success "Removed $removed_count Kubernetes images and cleaned up manifests"
+    else
+        log_info "Cleanup cancelled"
+    fi
 }
 
 # Fresh installation
@@ -802,6 +906,7 @@ COMMANDS:
     delete          Delete the Kubernetes cluster
     status          Show cluster status and information
     troubleshoot    Run diagnostics
+    clean-images    Remove local Kubernetes images
     help            Show this help
 
 OPTIONS:
@@ -822,12 +927,15 @@ EXAMPLES:
     $0 fresh-install                                     # Complete setup with defaults
     $0 configure-images                                  # Interactive image configuration
     $0 start --memory 8192 --cpus 4                     # Start with more resources
-    $0 start --pause "my-registry.com/pause:3.9" --apiserver "my-registry.com/kube-apiserver:v1.31.1"
-    $0 configure-images                                  # Interactive image configuration
+    $0 start --pause "my-registry.com/pause:3.9" \\
+             --apiserver "my-registry.com/kube-apiserver:v1.31.1"
+    $0 clean-images                                      # Remove cached images
+    $0 troubleshoot                                      # Run full diagnostics
     
 CONFIGURATION FILES:
-    ~/.local-cluster-cli/images.conf    # Custom image URLs
-    ~/.local-cluster-cli/cluster.log    # Installation and runtime logs
+    ~/.local-cluster-cli/images.conf        # Custom image URLs
+    ~/.local-cluster-cli/cluster.log        # Installation and runtime logs
+    ~/.local-cluster-cli/image-manifest.txt # Local image cache manifest
 
 INDIVIDUAL IMAGE OVERRIDE EXAMPLES:
     # Use custom images from your private registry
@@ -845,6 +953,14 @@ INDIVIDUAL IMAGE OVERRIDE EXAMPLES:
 DEFAULT IMAGES (when no custom URLs specified):
     kicbase: gcr.io/k8s-minikube/kicbase:latest
     All others: registry.k8s.io/[component]:[version]
+
+FEATURES:
+    ✓ Automatic image pre-pulling and tagging for offline use
+    ✓ Intelligent fallback to alternative registries
+    ✓ Local image caching to prevent unnecessary downloads
+    ✓ Support for custom private registries
+    ✓ Comprehensive diagnostics and troubleshooting
+    ✓ WSL + Windows Docker Desktop integration
 
 EOF
 }
@@ -946,6 +1062,9 @@ main() {
         troubleshoot)
             troubleshoot
             ;;
+        clean-images)
+            clean_images
+            ;;
         help|--help|-h)
             show_help
             ;;
@@ -957,5 +1076,5 @@ main() {
     esac
 }
 
-# Run main function
+# Run main function with all arguments
 main "$@"
