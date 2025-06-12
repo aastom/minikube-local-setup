@@ -45,6 +45,26 @@ DEFAULT_REGISTRY="registry.k8s.io"
 # Create config directory
 mkdir -p "$CONFIG_DIR"
 
+# Handle interruption signals for clean shutdown
+cleanup_on_exit() {
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        log_warning "Script interrupted or failed (exit code: $exit_code)"
+        log_info "Check logs at: $LOG_FILE"
+        
+        # If minikube start was in progress, suggest cleanup
+        if pgrep -f "minikube start.*$PROFILE_NAME" >/dev/null 2>&1; then
+            log_warning "Minikube start process detected, you may want to run:"
+            log_info "  $0 delete  # to clean up partial installation"
+        fi
+    fi
+}
+
+# Set up signal handlers
+trap cleanup_on_exit EXIT
+trap 'log_warning "Received SIGINT, shutting down..."; exit 130' INT
+trap 'log_warning "Received SIGTERM, shutting down..."; exit 143' TERM
+
 # Logging functions
 log() {
     local level=$1
@@ -371,10 +391,10 @@ pre_pull_and_tag_images() {
     # Also pre-pull kicbase if specified (exact URL as provided)
     if [[ -n "$KICBASE_IMAGE" ]]; then
         log_info "Pre-pulling kicbase: $KICBASE_IMAGE"
-        if docker pull "$KICBASE_IMAGE" 2>/dev/null; then
+        if timeout 300 docker pull "$KICBASE_IMAGE" 2>/dev/null; then
             log_success "Successfully pre-pulled kicbase: $KICBASE_IMAGE"
         else
-            log_warning "Failed to pull kicbase image: $KICBASE_IMAGE"
+            log_warning "Failed to pull kicbase image: $KICBASE_IMAGE (timeout or error)"
             log_info "Minikube will attempt to download it during cluster start"
         fi
     fi
@@ -382,8 +402,13 @@ pre_pull_and_tag_images() {
     local pull_failures=0
     local pull_successes=0
     local tag_successes=0
+    local total_images=${#image_specs[@]}
+    local current_image=0
     
     for component in "${!image_specs[@]}"; do
+        ((current_image++))
+        log_info "Processing image $current_image/$total_images: $component"
+        
         IFS='|' read -r custom_var default_component default_version <<< "${image_specs[$component]}"
         
         # Get the custom image URL using indirect variable reference
@@ -393,76 +418,92 @@ pre_pull_and_tag_images() {
         local source_image
         if [[ -n "$custom_image_url" ]]; then
             source_image="$custom_image_url"
-            log_info "Processing $component with custom image: $source_image"
+            log_info "  Using custom image: $source_image"
         else
             source_image="${DEFAULT_REGISTRY}/${default_component}:${default_version}"
-            log_info "Processing $component with default image: $source_image"
+            log_info "  Using default image: $source_image"
         fi
         
         # Get expected minikube tag (what minikube expects to find locally)
         local minikube_tag
         minikube_tag=$(get_minikube_image_tags "$component" "$default_version")
         
-        # Pull the exact image URL as specified
-        if docker pull "$source_image" 2>/dev/null; then
-            log_success "Successfully pulled: $source_image"
+        # Pull the exact image URL as specified with timeout
+        log_info "  Pulling: $source_image"
+        if timeout 300 docker pull "$source_image" 2>/dev/null; then
+            log_success "  Successfully pulled: $source_image"
             ((pull_successes++))
             
             # Tag for minikube if different from source
             if [[ "$source_image" != "$minikube_tag" ]]; then
+                log_info "  Tagging as: $minikube_tag"
                 if docker tag "$source_image" "$minikube_tag" 2>/dev/null; then
-                    log_success "Tagged as: $minikube_tag"
+                    log_success "  Tagged successfully"
                     ((tag_successes++))
                 else
-                    log_warning "Failed to tag $source_image as $minikube_tag"
+                    log_warning "  Failed to tag $source_image as $minikube_tag"
                 fi
             else
-                log_info "Image already has correct tag for minikube: $minikube_tag"
+                log_info "  Image already has correct tag for minikube"
                 ((tag_successes++))
             fi
         else
-            log_warning "Failed to pull: $source_image"
+            log_warning "  Failed to pull: $source_image (timeout or error)"
             
             # Only try fallback registries if using default images (not custom URLs)
             if [[ -z "$custom_image_url" ]]; then
-                log_info "Trying fallback registries for default image..."
+                log_info "  Trying fallback registries for default image..."
                 local fallback_success=false
                 
-                for alt_reg in "k8s.gcr.io" "gcr.io/k8s-minikube"; do
+                local fallback_registries=("k8s.gcr.io" "gcr.io/k8s-minikube")
+                for alt_reg in "${fallback_registries[@]}"; do
                     local alt_image="${alt_reg}/${default_component}:${default_version}"
-                    log_info "Trying fallback: $alt_image"
-                    if docker pull "$alt_image" 2>/dev/null; then
+                    log_info "  Trying fallback: $alt_image"
+                    if timeout 180 docker pull "$alt_image" 2>/dev/null; then
+                        log_success "  Fallback pull successful: $alt_image"
                         if docker tag "$alt_image" "$minikube_tag" 2>/dev/null; then
-                            log_success "Tagged fallback $alt_image as $minikube_tag"
+                            log_success "  Tagged fallback as: $minikube_tag"
                             fallback_success=true
                             ((pull_successes++))
                             ((tag_successes++))
                             break
                         else
-                            log_warning "Failed to tag $alt_image as $minikube_tag"
+                            log_warning "  Failed to tag $alt_image as $minikube_tag"
                         fi
+                    else
+                        log_info "  Fallback failed: $alt_image"
                     fi
                 done
                 
                 if [[ "$fallback_success" != true ]]; then
-                    log_warning "All fallback attempts failed for $component"
+                    log_warning "  All fallback attempts failed for $component"
                     ((pull_failures++))
                 fi
             else
-                log_warning "Custom image URL failed, no fallback attempted for $component"
-                log_info "Please verify the custom image URL: $custom_image_url"
+                log_warning "  Custom image URL failed, no fallback attempted"
+                log_info "  Please verify the custom image URL: $custom_image_url"
                 ((pull_failures++))
             fi
         fi
+        
+        # Progress indicator
+        log_info "  Progress: $current_image/$total_images images processed"
+        echo
     done
     
-    log_info "Image processing summary:"
-    log_info "  Pulls: $pull_successes successful, $pull_failures failed"
-    log_info "  Tags: $tag_successes successful"
+    echo "========================================"
+    log_info "Image processing completed!"
+    log_info "  Total images processed: $total_images"
+    log_info "  Successful pulls: $pull_successes"
+    log_info "  Failed pulls: $pull_failures"
+    log_info "  Successful tags: $tag_successes"
+    echo "========================================"
     
     if [[ $pull_failures -gt 0 ]]; then
         log_warning "Some images failed to pre-pull, but continuing with cluster start"
         log_info "Minikube will attempt to download missing images during startup"
+    else
+        log_success "All images successfully pulled and tagged!"
     fi
     
     # Save image manifest for minikube
@@ -594,47 +635,93 @@ start_minikube() {
     while [[ $retry_count -lt $max_retries ]]; do
         log_info "=== CLUSTER START ATTEMPT $((retry_count + 1))/$max_retries ==="
         
+        # Set timeout for minikube start
+        local start_timeout=900  # 15 minutes
+        
         set +e  # Temporarily disable exit on error
-        minikube start "${start_args[@]}"
+        log_info "Starting minikube with timeout of ${start_timeout} seconds..."
+        
+        # Use timeout command to prevent hanging
+        timeout $start_timeout minikube start "${start_args[@]}"
         local start_exit_code=$?
         set -e  # Re-enable exit on error
         
         if [[ $start_exit_code -eq 0 ]]; then
             log_success "Cluster started successfully!"
             break
+        elif [[ $start_exit_code -eq 124 ]]; then
+            log_error "Minikube start timed out after ${start_timeout} seconds"
+            ((retry_count++))
         else
             log_error "Minikube start failed with exit code: $start_exit_code"
             ((retry_count++))
+        fi
+        
+        if [[ $retry_count -lt $max_retries ]]; then
+            log_warning "Cleaning up failed cluster and retrying in 10 seconds..."
             
-            if [[ $retry_count -lt $max_retries ]]; then
-                log_warning "Cleaning up failed cluster and retrying..."
-                minikube delete -p "$PROFILE_NAME" 2>/dev/null || true
-                sleep 10
-            else
-                log_error "Failed to start cluster after $max_retries attempts"
-                log_error "Final exit code: $start_exit_code"
-                log_info "Try running manually with: minikube start --profile $PROFILE_NAME --driver $MINIKUBE_DRIVER"
-                log_info "Or check logs with: minikube logs -p $PROFILE_NAME"
-                return 1
-            fi
+            # Force cleanup with timeout
+            timeout 60 minikube delete -p "$PROFILE_NAME" 2>/dev/null || {
+                log_warning "Cleanup timed out, forcing docker cleanup..."
+                docker ps -a --filter "name=$PROFILE_NAME" --format "{{.ID}}" | xargs -r docker rm -f 2>/dev/null || true
+            }
+            
+            sleep 10
+        else
+            log_error "Failed to start cluster after $max_retries attempts"
+            log_error "Final exit code: $start_exit_code"
+            
+            echo "========================================"
+            log_error "TROUBLESHOOTING INFORMATION:"
+            echo "========================================"
+            log_info "1. Check minikube logs: minikube logs -p $PROFILE_NAME"
+            log_info "2. Try manual start: minikube start --profile $PROFILE_NAME --driver $MINIKUBE_DRIVER --v=3"
+            log_info "3. Check Docker status: docker info"
+            log_info "4. Run diagnostics: $0 troubleshoot"
+            log_info "5. Clean and retry: $0 delete && $0 start"
+            echo "========================================"
+            
+            return 1
         fi
     done
     
     # Wait for cluster to be ready
+    echo "========================================"
     log_info "Waiting for cluster to be ready..."
+    echo "========================================"
+    
     local ready_retry=0
-    while [[ $ready_retry -lt 60 ]]; do
-        if kubectl get nodes --request-timeout=10s >/dev/null 2>&1; then
+    local max_ready_retries=60
+    local ready_success=false
+    
+    while [[ $ready_retry -lt $max_ready_retries ]]; do
+        log_info "Checking cluster readiness... (attempt $((ready_retry + 1))/$max_ready_retries)"
+        
+        if timeout 30 kubectl get nodes --request-timeout=10s >/dev/null 2>&1; then
             log_success "Cluster is ready!"
+            ready_success=true
             break
+        else
+            log_info "Cluster not ready yet, waiting 5 seconds..."
+            sleep 5
+            ((ready_retry++))
         fi
-        sleep 5
-        ((ready_retry++))
     done
     
+    if [[ "$ready_success" != true ]]; then
+        log_warning "Cluster readiness check timed out, but continuing..."
+        log_info "You can check cluster status later with: kubectl get nodes"
+    fi
+    
     # Configure post-startup components
+    echo "========================================"
+    log_info "Configuring cluster components..."
+    echo "========================================"
     configure_post_startup_components
     
+    echo "========================================"
+    log_success "Cluster setup completed!"
+    echo "========================================"
     show_cluster_info
 }
 
