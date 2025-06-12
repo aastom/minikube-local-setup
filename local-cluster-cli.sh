@@ -506,34 +506,82 @@ start_minikube() {
         log_info "Using default images from $DEFAULT_REGISTRY"
     fi
     
+    # Debug: Check if minikube command exists
+    if ! command_exists minikube; then
+        log_error "Minikube command not found! Please install minikube first."
+        return 1
+    fi
+    
+    # Debug: Show minikube version
+    log_info "Minikube version: $(minikube version --short 2>/dev/null || echo 'unknown')"
+    
+    log_info "=== STARTING MINIKUBE CLUSTER ==="
+    log_info "Profile: $PROFILE_NAME"
+    log_info "Driver: $MINIKUBE_DRIVER"
+    log_info "Memory: ${MINIKUBE_MEMORY}MB"
+    log_info "CPUs: $MINIKUBE_CPUS"
+    
+    # Debug: Show the command that will be executed
+    log_info "Minikube command to execute:"
+    log_info "$start_cmd"
+    
+    # Alternative: Try executing minikube directly with individual arguments
+    log_info "=== ATTEMPTING MINIKUBE START ==="
+    
     # Start cluster with retry logic
     local retry_count=0
     local max_retries=3
     
-    log_info "=== STARTING MINIKUBE CLUSTER ==="
-    log_info "Command: $start_cmd"
-    
     while [[ $retry_count -lt $max_retries ]]; do
-        log_info "Cluster start attempt $((retry_count + 1))/$max_retries"
+        log_info "=== CLUSTER START ATTEMPT $((retry_count + 1))/$max_retries ==="
         
-        if eval "$start_cmd"; then
+        # Try a more direct approach first
+        log_info "Starting minikube cluster..."
+        
+        # Execute minikube start with explicit arguments to avoid command parsing issues
+        set +e  # Temporarily disable exit on error
+        
+        minikube start \
+            --driver="$MINIKUBE_DRIVER" \
+            --memory="$MINIKUBE_MEMORY" \
+            --cpus="$MINIKUBE_CPUS" \
+            --disk-size="$MINIKUBE_DISK_SIZE" \
+            --profile="$PROFILE_NAME" \
+            --insecure-registry="$INSECURE_REGISTRIES" \
+            --embed-certs=true \
+            --delete-on-failure \
+            ${KICBASE_IMAGE:+--base-image="$KICBASE_IMAGE"} \
+            ${PAUSE_IMAGE:+--extra-config=kubelet.pod-infra-container-image="$PAUSE_IMAGE"} \
+            ${KUBE_APISERVER_IMAGE:+--extra-config=apiserver.image="$KUBE_APISERVER_IMAGE"} \
+            ${KUBE_CONTROLLER_MANAGER_IMAGE:+--extra-config=controller-manager.image="$KUBE_CONTROLLER_MANAGER_IMAGE"} \
+            ${KUBE_SCHEDULER_IMAGE:+--extra-config=scheduler.image="$KUBE_SCHEDULER_IMAGE"} \
+            ${ETCD_IMAGE:+--extra-config=etcd.image="$ETCD_IMAGE"}
+        
+        local start_exit_code=$?
+        set -e  # Re-enable exit on error
+        
+        if [[ $start_exit_code -eq 0 ]]; then
             log_success "Cluster started successfully!"
             break
         else
-            local exit_code=$?
+            log_error "Minikube start failed with exit code: $start_exit_code"
             ((retry_count++))
+            
             if [[ $retry_count -lt $max_retries ]]; then
-                log_warning "Start failed with exit code $exit_code, cleaning up and retrying..."
+                log_warning "Cleaning up failed cluster and retrying..."
                 minikube delete -p "$PROFILE_NAME" 2>/dev/null || true
                 sleep 10
             else
                 log_error "Failed to start cluster after $max_retries attempts"
-                log_error "Last exit code: $exit_code"
-                log_info "You can check logs with: minikube logs -p $PROFILE_NAME"
+                log_error "Final exit code: $start_exit_code"
+                log_info "Try running manually with: minikube start --profile $PROFILE_NAME --driver $MINIKUBE_DRIVER"
+                log_info "Or check logs with: minikube logs -p $PROFILE_NAME"
                 return 1
             fi
         fi
     done
+    
+    log_info "Cluster start phase completed, checking status..."
     
     # Wait for cluster to be ready
     log_info "Waiting for cluster to be ready..."
