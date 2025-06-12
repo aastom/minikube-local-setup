@@ -20,9 +20,25 @@ MINIKUBE_DRIVER="docker"
 KUBECTL_VERSION="v1.31.1"
 PROFILE_NAME="enterprise-k8s"
 INSECURE_REGISTRIES="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,europe-docker.pkg.dev"
-IMAGE_REPOSITORY="europe-docker.pkg.dev/mgmt-bak-bld-1dd7/staging/ap/edh/a107595/images/platform-tools/registry.k8s.io"
+IMAGE_REPOSITORY="europe-docker.pkg.dev/mgmt-bak-bld-1d47/staging/ap/edh/a107595/images/platform-tools/registry.k8s.io"
 CONFIG_DIR="$HOME/.local-cluster-cli"
 LOG_FILE="$CONFIG_DIR/cluster.log"
+
+# Individual image URLs - can be overridden via command line or config file
+KICBASE_IMAGE=""
+PAUSE_IMAGE=""
+KUBE_APISERVER_IMAGE=""
+KUBE_CONTROLLER_MANAGER_IMAGE=""
+KUBE_SCHEDULER_IMAGE=""
+KUBE_PROXY_IMAGE=""
+ETCD_IMAGE=""
+COREDNS_IMAGE=""
+
+# Default image versions
+PAUSE_VERSION="3.9"
+KUBE_VERSION="v1.31.1"
+ETCD_VERSION="3.5.15-0"
+COREDNS_VERSION="v1.11.1"
 
 # Create config directory
 mkdir -p "$CONFIG_DIR"
@@ -225,30 +241,39 @@ install_kubectl() {
 pre_pull_images() {
     log_info "Pre-pulling required Kubernetes images..."
     
+    # Define images with their custom URLs or defaults
     local images=(
-        "pause:3.9"
-        "kube-apiserver:v1.31.1"
-        "kube-controller-manager:v1.31.1"
-        "kube-scheduler:v1.31.1"
-        "kube-proxy:v1.31.1"
-        "etcd:3.5.15-0"
-        "coredns:v1.11.1"
+        "pause:$(get_image_url "pause" "$PAUSE_IMAGE" "pause" "$PAUSE_VERSION")"
+        "kube-apiserver:$(get_image_url "apiserver" "$KUBE_APISERVER_IMAGE" "kube-apiserver" "$KUBE_VERSION")"
+        "kube-controller-manager:$(get_image_url "controller-manager" "$KUBE_CONTROLLER_MANAGER_IMAGE" "kube-controller-manager" "$KUBE_VERSION")"
+        "kube-scheduler:$(get_image_url "scheduler" "$KUBE_SCHEDULER_IMAGE" "kube-scheduler" "$KUBE_VERSION")"
+        "kube-proxy:$(get_image_url "proxy" "$KUBE_PROXY_IMAGE" "kube-proxy" "$KUBE_VERSION")"
+        "etcd:$(get_image_url "etcd" "$ETCD_IMAGE" "etcd" "$ETCD_VERSION")"
+        "coredns:$(get_image_url "coredns" "$COREDNS_IMAGE" "coredns" "$COREDNS_VERSION")"
     )
     
-    for image in "${images[@]}"; do
-        local full_image="${IMAGE_REPOSITORY}/k8s-minikube/${image}"
-        log_info "Pulling: $full_image"
+    for image_spec in "${images[@]}"; do
+        local component="${image_spec%%:*}"
+        local image_url="${image_spec#*:}"
         
-        if ! docker pull "$full_image" 2>/dev/null; then
-            log_warning "Failed to pull $full_image, trying fallback"
-            # Try alternative registries
-            for alt_reg in "k8s.gcr.io" "gcr.io/k8s-minikube"; do
-                local alt_image="${alt_reg}/${image}"
+        log_info "Pulling $component: $image_url"
+        
+        if ! docker pull "$image_url" 2>/dev/null; then
+            log_warning "Failed to pull $image_url, trying fallback registries"
+            
+            # Try alternative registries for standard images
+            local base_image="${component}:${image_url##*:}"
+            for alt_reg in "k8s.gcr.io" "gcr.io/k8s-minikube" "registry.k8s.io"; do
+                local alt_image="${alt_reg}/${base_image}"
+                log_info "Trying: $alt_image"
                 if docker pull "$alt_image" 2>/dev/null; then
-                    docker tag "$alt_image" "$full_image" 2>/dev/null || true
+                    docker tag "$alt_image" "$image_url" 2>/dev/null || true
+                    log_success "Tagged $alt_image as $image_url"
                     break
                 fi
             done
+        else
+            log_success "Successfully pulled $image_url"
         fi
     done
 }
@@ -256,6 +281,9 @@ pre_pull_images() {
 # Start minikube cluster
 start_minikube() {
     log_info "Starting Kubernetes cluster..."
+    
+    # Load custom image configuration
+    load_image_config
     
     # Check if already running
     if command_exists minikube && minikube status -p "$PROFILE_NAME" 2>/dev/null | grep -q "Running"; then
@@ -279,8 +307,49 @@ start_minikube() {
     start_cmd+=" --disk-size=$MINIKUBE_DISK_SIZE"
     start_cmd+=" --profile=$PROFILE_NAME"
     start_cmd+=" --insecure-registry=\"$INSECURE_REGISTRIES\""
-    start_cmd+=" --image-repository=\"$IMAGE_REPOSITORY\""
     start_cmd+=" --embed-certs=true"
+    
+    # Add custom kicbase image if specified
+    if [[ -n "$KICBASE_IMAGE" ]]; then
+        start_cmd+=" --base-image=\"$KICBASE_IMAGE\""
+        log_info "Using custom kicbase image: $KICBASE_IMAGE"
+    fi
+    
+    # Add image repository (will be overridden by individual images if specified)
+    if [[ -n "$IMAGE_REPOSITORY" ]]; then
+        start_cmd+=" --image-repository=\"$IMAGE_REPOSITORY\""
+        log_info "Using base image repository: $IMAGE_REPOSITORY"
+    fi
+    
+    # Add individual image overrides
+    if [[ -n "$PAUSE_IMAGE" ]]; then
+        start_cmd+=" --extra-config=kubelet.pod-infra-container-image=\"$PAUSE_IMAGE\""
+        log_info "Using custom pause image: $PAUSE_IMAGE"
+    fi
+    
+    # Add custom apiserver image
+    if [[ -n "$KUBE_APISERVER_IMAGE" ]]; then
+        start_cmd+=" --extra-config=apiserver.image=\"$KUBE_APISERVER_IMAGE\""
+        log_info "Using custom apiserver image: $KUBE_APISERVER_IMAGE"
+    fi
+    
+    # Add custom controller-manager image
+    if [[ -n "$KUBE_CONTROLLER_MANAGER_IMAGE" ]]; then
+        start_cmd+=" --extra-config=controller-manager.image=\"$KUBE_CONTROLLER_MANAGER_IMAGE\""
+        log_info "Using custom controller-manager image: $KUBE_CONTROLLER_MANAGER_IMAGE"
+    fi
+    
+    # Add custom scheduler image
+    if [[ -n "$KUBE_SCHEDULER_IMAGE" ]]; then
+        start_cmd+=" --extra-config=scheduler.image=\"$KUBE_SCHEDULER_IMAGE\""
+        log_info "Using custom scheduler image: $KUBE_SCHEDULER_IMAGE"
+    fi
+    
+    # Add custom etcd image
+    if [[ -n "$ETCD_IMAGE" ]]; then
+        start_cmd+=" --extra-config=etcd.image=\"$ETCD_IMAGE\""
+        log_info "Using custom etcd image: $ETCD_IMAGE"
+    fi
     
     # Start cluster with retry logic
     local retry_count=0
@@ -463,6 +532,9 @@ fresh_install() {
     install_minikube
     install_kubectl
     
+    # Load image configuration
+    load_image_config
+    
     # Clean up any existing cluster
     if command_exists minikube && minikube status -p "$PROFILE_NAME" >/dev/null 2>&1; then
         log_warning "Removing existing cluster..."
@@ -486,6 +558,7 @@ USAGE:
 COMMANDS:
     fresh-install    Complete installation and cluster setup
     setup-docker     Setup Windows Docker.exe wrapper for WSL
+    configure-images Configure individual image URLs for Kubernetes components
     start           Start the Kubernetes cluster
     stop            Stop the Kubernetes cluster
     delete          Delete the Kubernetes cluster
@@ -497,12 +570,37 @@ OPTIONS:
     --memory MEMORY     Memory allocation in MB [default: 4096]
     --cpus CPUS        Number of CPUs [default: 2]
     --profile NAME     Cluster profile name [default: enterprise-k8s]
+    --kicbase IMAGE    Custom kicbase image URL for minikube VM
+    --pause IMAGE      Custom pause container image URL
+    --apiserver IMAGE  Custom kube-apiserver image URL
+    --scheduler IMAGE  Custom kube-scheduler image URL
+    --controller IMAGE Custom kube-controller-manager image URL
+    --proxy IMAGE      Custom kube-proxy image URL
+    --etcd IMAGE       Custom etcd image URL
+    --coredns IMAGE    Custom coredns image URL
 
 EXAMPLES:
-    $0 fresh-install                    # Complete setup
-    $0 setup-docker                     # Setup Windows Docker wrapper
-    $0 start --memory 8192 --cpus 4     # Start with more resources
-    $0 status                           # Show cluster status
+    $0 fresh-install                                     # Complete setup with defaults
+    $0 configure-images                                  # Interactive image configuration
+    $0 start --memory 8192 --cpus 4                     # Start with more resources
+    $0 start --pause my-registry.com/pause:3.9          # Start with custom pause image
+    $0 start --apiserver my-registry.com/kube-apiserver:v1.31.1 # Custom apiserver
+    
+CONFIGURATION FILES:
+    ~/.local-cluster-cli/images.conf    # Custom image URLs
+    ~/.local-cluster-cli/cluster.log    # Installation and runtime logs
+
+INDIVIDUAL IMAGE OVERRIDE EXAMPLES:
+    # Use custom images from your private registry
+    $0 start \\
+        --kicbase "my-registry.com/kicbase:v0.0.44" \\
+        --pause "my-registry.com/pause:3.9" \\
+        --apiserver "my-registry.com/kube-apiserver:v1.31.1" \\
+        --scheduler "my-registry.com/kube-scheduler:v1.31.1" \\
+        --controller "my-registry.com/kube-controller-manager:v1.31.1" \\
+        --proxy "my-registry.com/kube-proxy:v1.31.1" \\
+        --etcd "my-registry.com/etcd:3.5.15-0" \\
+        --coredns "my-registry.com/coredns:v1.11.1"
 
 EOF
 }
@@ -521,6 +619,38 @@ parse_args() {
                 ;;
             --profile)
                 PROFILE_NAME="$2"
+                shift 2
+                ;;
+            --kicbase)
+                KICBASE_IMAGE="$2"
+                shift 2
+                ;;
+            --pause)
+                PAUSE_IMAGE="$2"
+                shift 2
+                ;;
+            --apiserver)
+                KUBE_APISERVER_IMAGE="$2"
+                shift 2
+                ;;
+            --scheduler)
+                KUBE_SCHEDULER_IMAGE="$2"
+                shift 2
+                ;;
+            --controller)
+                KUBE_CONTROLLER_MANAGER_IMAGE="$2"
+                shift 2
+                ;;
+            --proxy)
+                KUBE_PROXY_IMAGE="$2"
+                shift 2
+                ;;
+            --etcd)
+                ETCD_IMAGE="$2"
+                shift 2
+                ;;
+            --coredns)
+                COREDNS_IMAGE="$2"
                 shift 2
                 ;;
             *)
@@ -549,6 +679,9 @@ main() {
             ;;
         setup-docker)
             setup_windows_docker
+            ;;
+        configure-images)
+            configure_images
             ;;
         start)
             start_minikube
