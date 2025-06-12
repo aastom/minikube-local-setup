@@ -229,6 +229,41 @@ EOF
     fi
 }
 
+# Check minikube version and capabilities
+check_minikube_version() {
+    if ! command_exists minikube; then
+        return 1
+    fi
+    
+    local version_output
+    version_output=$(minikube version --short 2>/dev/null || minikube version 2>/dev/null || echo "unknown")
+    
+    log_info "Detected minikube version: $version_output"
+    
+    # Extract version number for feature checks
+    local version_number
+    version_number=$(echo "$version_output" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/v//')
+    
+    if [[ -n "$version_number" ]]; then
+        log_info "Minikube version: $version_number"
+        
+        # Check if version supports --pull-policy flag (introduced in v1.25.0)
+        local major minor patch
+        IFS='.' read -r major minor patch <<< "$version_number"
+        
+        if [[ $major -gt 1 ]] || [[ $major -eq 1 && $minor -gt 25 ]] || [[ $major -eq 1 && $minor -eq 25 && $patch -ge 0 ]]; then
+            export MINIKUBE_SUPPORTS_PULL_POLICY=true
+            log_info "This minikube version supports --pull-policy flag"
+        else
+            export MINIKUBE_SUPPORTS_PULL_POLICY=false
+            log_info "This minikube version does not support --pull-policy flag"
+        fi
+    else
+        export MINIKUBE_SUPPORTS_PULL_POLICY=false
+        log_warning "Could not determine minikube version, assuming older version"
+    fi
+}
+
 # Check if command exists
 command_exists() {
     command -v "$1" >/dev/null 2>&1
@@ -536,8 +571,16 @@ configure_minikube_local_images() {
     minikube config set image-mirror-country "" -p "$PROFILE_NAME" 2>/dev/null || true
     minikube config set image-repository "" -p "$PROFILE_NAME" 2>/dev/null || true
     
-    # Configure to skip pulling if images exist locally
+    # Configure environment to skip pulling if images exist locally
+    # This works with older minikube versions
     export MINIKUBE_PULL_POLICY="IfNotPresent"
+    export MINIKUBE_IMAGE_PULL_POLICY="IfNotPresent"
+    
+    # For Docker driver, ensure we're using the same Docker daemon
+    if [[ "$MINIKUBE_DRIVER" == "docker" ]]; then
+        log_info "Configuring Docker driver for local image access..."
+        # The docker driver shares the host docker daemon, so local images should be available
+    fi
     
     log_success "Minikube configured to prefer local images"
 }
@@ -582,6 +625,9 @@ start_minikube() {
     
     log_info "Proceeding with cluster start..."
     
+    # Check minikube version and capabilities
+    check_minikube_version
+    
     # Build minikube start command
     local start_args=(
         "--driver=$MINIKUBE_DRIVER"
@@ -592,8 +638,15 @@ start_minikube() {
         "--insecure-registry=$INSECURE_REGISTRIES"
         "--embed-certs=true"
         "--delete-on-failure"
-        "--pull-policy=IfNotPresent"
     )
+    
+    # Add pull policy flag only if supported
+    if [[ "${MINIKUBE_SUPPORTS_PULL_POLICY:-false}" == "true" ]]; then
+        start_args+=("--pull-policy=IfNotPresent")
+        log_info "Added --pull-policy=IfNotPresent flag"
+    else
+        log_info "Using environment variables for pull policy (older minikube version)"
+    fi
     
     # Add custom kicbase image if specified
     if [[ -n "$KICBASE_IMAGE" ]]; then
