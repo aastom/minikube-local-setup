@@ -41,21 +41,69 @@ log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
+# Function to extract tag from image URL
+extract_tag() {
+    local image_url="$1"
+    echo "${image_url##*:}"
+}
+
+# Function to extract repository path from image URL (everything before the tag)
+extract_repo() {
+    local image_url="$1"
+    echo "${image_url%:*}"
+}
+
 # Function to pull and tag images
 pull_and_tag_images() {
     log_info "=== STEP 1: PULLING AND TAGGING IMAGES ==="
     
-    # Define image mappings: local_name:source_image:minikube_expected_tag
+    # Extract actual tags from custom images or use defaults
+    local pause_tag="${PAUSE_VERSION}"
+    local kube_tag="${KUBE_VERSION}"
+    local etcd_tag="${ETCD_VERSION}"
+    local coredns_tag="${COREDNS_VERSION}"
+    local storage_tag="${STORAGE_PROVISIONER_VERSION}"
+    local kicbase_tag="v0.0.47"
+    
+    if [[ -n "$CUSTOM_PAUSE_IMAGE" ]]; then
+        pause_tag=$(extract_tag "$CUSTOM_PAUSE_IMAGE")
+    fi
+    if [[ -n "$CUSTOM_APISERVER_IMAGE" ]]; then
+        kube_tag=$(extract_tag "$CUSTOM_APISERVER_IMAGE")
+    fi
+    if [[ -n "$CUSTOM_ETCD_IMAGE" ]]; then
+        etcd_tag=$(extract_tag "$CUSTOM_ETCD_IMAGE")
+    fi
+    if [[ -n "$CUSTOM_COREDNS_IMAGE" ]]; then
+        coredns_tag=$(extract_tag "$CUSTOM_COREDNS_IMAGE")
+    fi
+    if [[ -n "$CUSTOM_STORAGE_IMAGE" ]]; then
+        storage_tag=$(extract_tag "$CUSTOM_STORAGE_IMAGE")
+    fi
+    if [[ -n "$CUSTOM_KICBASE_IMAGE" ]]; then
+        kicbase_tag=$(extract_tag "$CUSTOM_KICBASE_IMAGE")
+    fi
+    
+    log_info "Extracted tags:"
+    log_info "  pause: $pause_tag"
+    log_info "  kube components: $kube_tag"
+    log_info "  etcd: $etcd_tag"
+    log_info "  coredns: $coredns_tag"
+    log_info "  storage: $storage_tag"
+    log_info "  kicbase: $kicbase_tag"
+    echo
+    
+    # Define image mappings using extracted tags
     declare -A images=(
-        ["pause"]="${CUSTOM_PAUSE_IMAGE:-registry.k8s.io/pause:$PAUSE_VERSION}:registry.k8s.io/pause:$PAUSE_VERSION"
-        ["apiserver"]="${CUSTOM_APISERVER_IMAGE:-registry.k8s.io/kube-apiserver:$KUBE_VERSION}:registry.k8s.io/kube-apiserver:$KUBE_VERSION"
-        ["controller"]="${CUSTOM_CONTROLLER_IMAGE:-registry.k8s.io/kube-controller-manager:$KUBE_VERSION}:registry.k8s.io/kube-controller-manager:$KUBE_VERSION"
-        ["scheduler"]="${CUSTOM_SCHEDULER_IMAGE:-registry.k8s.io/kube-scheduler:$KUBE_VERSION}:registry.k8s.io/kube-scheduler:$KUBE_VERSION"
-        ["proxy"]="${CUSTOM_PROXY_IMAGE:-registry.k8s.io/kube-proxy:$KUBE_VERSION}:registry.k8s.io/kube-proxy:$KUBE_VERSION"
-        ["etcd"]="${CUSTOM_ETCD_IMAGE:-registry.k8s.io/etcd:$ETCD_VERSION}:registry.k8s.io/etcd:$ETCD_VERSION"
-        ["coredns"]="${CUSTOM_COREDNS_IMAGE:-registry.k8s.io/coredns/coredns:$COREDNS_VERSION}:registry.k8s.io/coredns/coredns:$COREDNS_VERSION"
-        ["storage"]="${CUSTOM_STORAGE_IMAGE:-gcr.io/k8s-minikube/storage-provisioner:$STORAGE_PROVISIONER_VERSION}:gcr.io/k8s-minikube/storage-provisioner:$STORAGE_PROVISIONER_VERSION"
-        ["kicbase"]="${CUSTOM_KICBASE_IMAGE:-gcr.io/k8s-minikube/kicbase:v0.0.47}:gcr.io/k8s-minikube/kicbase:v0.0.47"
+        ["pause"]="${CUSTOM_PAUSE_IMAGE:-registry.k8s.io/pause:$pause_tag}:registry.k8s.io/pause:$pause_tag"
+        ["apiserver"]="${CUSTOM_APISERVER_IMAGE:-registry.k8s.io/kube-apiserver:$kube_tag}:registry.k8s.io/kube-apiserver:$kube_tag"
+        ["controller"]="${CUSTOM_CONTROLLER_IMAGE:-registry.k8s.io/kube-controller-manager:$kube_tag}:registry.k8s.io/kube-controller-manager:$kube_tag"
+        ["scheduler"]="${CUSTOM_SCHEDULER_IMAGE:-registry.k8s.io/kube-scheduler:$kube_tag}:registry.k8s.io/kube-scheduler:$kube_tag"
+        ["proxy"]="${CUSTOM_PROXY_IMAGE:-registry.k8s.io/kube-proxy:$kube_tag}:registry.k8s.io/kube-proxy:$kube_tag"
+        ["etcd"]="${CUSTOM_ETCD_IMAGE:-registry.k8s.io/etcd:$etcd_tag}:registry.k8s.io/etcd:$etcd_tag"
+        ["coredns"]="${CUSTOM_COREDNS_IMAGE:-registry.k8s.io/coredns/coredns:$coredns_tag}:registry.k8s.io/coredns/coredns:$coredns_tag"
+        ["storage"]="${CUSTOM_STORAGE_IMAGE:-gcr.io/k8s-minikube/storage-provisioner:$storage_tag}:gcr.io/k8s-minikube/storage-provisioner:$storage_tag"
+        ["kicbase"]="${CUSTOM_KICBASE_IMAGE:-gcr.io/k8s-minikube/kicbase:$kicbase_tag}:gcr.io/k8s-minikube/kicbase:$kicbase_tag"
     )
     
     for component in "${!images[@]}"; do
@@ -136,21 +184,48 @@ load_images_into_minikube() {
         return 1
     fi
     
-    # List of images to load
+    # Extract actual tags from custom images or use defaults
+    local pause_tag="${PAUSE_VERSION}"
+    local kube_tag="${KUBE_VERSION}"
+    local etcd_tag="${ETCD_VERSION}"
+    local coredns_tag="${COREDNS_VERSION}"
+    local storage_tag="${STORAGE_PROVISIONER_VERSION}"
+    local kicbase_tag="v0.0.47"
+    
+    if [[ -n "$CUSTOM_PAUSE_IMAGE" ]]; then
+        pause_tag=$(extract_tag "$CUSTOM_PAUSE_IMAGE")
+    fi
+    if [[ -n "$CUSTOM_APISERVER_IMAGE" ]]; then
+        kube_tag=$(extract_tag "$CUSTOM_APISERVER_IMAGE")
+    fi
+    if [[ -n "$CUSTOM_ETCD_IMAGE" ]]; then
+        etcd_tag=$(extract_tag "$CUSTOM_ETCD_IMAGE")
+    fi
+    if [[ -n "$CUSTOM_COREDNS_IMAGE" ]]; then
+        coredns_tag=$(extract_tag "$CUSTOM_COREDNS_IMAGE")
+    fi
+    if [[ -n "$CUSTOM_STORAGE_IMAGE" ]]; then
+        storage_tag=$(extract_tag "$CUSTOM_STORAGE_IMAGE")
+    fi
+    if [[ -n "$CUSTOM_KICBASE_IMAGE" ]]; then
+        kicbase_tag=$(extract_tag "$CUSTOM_KICBASE_IMAGE")
+    fi
+    
+    # List of images to load using extracted tags
     local images_to_load=(
-        "registry.k8s.io/pause:$PAUSE_VERSION"
-        "registry.k8s.io/kube-apiserver:$KUBE_VERSION"
-        "registry.k8s.io/kube-controller-manager:$KUBE_VERSION"
-        "registry.k8s.io/kube-scheduler:$KUBE_VERSION"
-        "registry.k8s.io/kube-proxy:$KUBE_VERSION"
-        "registry.k8s.io/etcd:$ETCD_VERSION"
-        "registry.k8s.io/coredns/coredns:$COREDNS_VERSION"
-        "gcr.io/k8s-minikube/storage-provisioner:$STORAGE_PROVISIONER_VERSION"
+        "registry.k8s.io/pause:$pause_tag"
+        "registry.k8s.io/kube-apiserver:$kube_tag"
+        "registry.k8s.io/kube-controller-manager:$kube_tag"
+        "registry.k8s.io/kube-scheduler:$kube_tag"
+        "registry.k8s.io/kube-proxy:$kube_tag"
+        "registry.k8s.io/etcd:$etcd_tag"
+        "registry.k8s.io/coredns/coredns:$coredns_tag"
+        "gcr.io/k8s-minikube/storage-provisioner:$storage_tag"
     )
     
     # Add kicbase if we have a custom one
     if [[ -n "$CUSTOM_KICBASE_IMAGE" ]]; then
-        images_to_load+=("gcr.io/k8s-minikube/kicbase:v0.0.47")
+        images_to_load+=("gcr.io/k8s-minikube/kicbase:$kicbase_tag")
     fi
     
     for image in "${images_to_load[@]}"; do
